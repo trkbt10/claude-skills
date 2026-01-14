@@ -1,15 +1,29 @@
 ---
 name: slide-studio
-description: Create and modify PowerPoint presentations (PPTX) through direct XML manipulation. Use this skill when creating presentations from scratch, adding/editing slides, inserting images, or applying POTX templates. Supports all 11 standard Office slide layouts.
+description: |
+  Create and modify PowerPoint presentations (PPTX) through direct XML manipulation.
+  Use this skill when: (1) Creating presentations from scratch, (2) Adding/editing/deleting slides,
+  (3) Inserting images or custom shapes, (4) Applying POTX templates for consistent branding,
+  (5) Editing existing PPTX files, (6) Working with slide layouts and placeholders,
+  (7) User asks to make a "presentation", "slides", "deck", or mentions ".pptx".
+  Supports all 11 standard Office slide layouts.
 ---
 
 # Slide Studio
 
 PowerPointプレゼンテーションをXML直接編集で作成。
 
-## Step 1: テンプレートを確認
+## Step 1: 目的を確認
 
 **必ず最初にユーザーに確認する:**
+
+> 何をしたいですか？
+>
+> 1. **新規作成**: 新しいプレゼンテーションを作成
+> 2. **テーマ適用**: 既存のPPTXに新しいテーマ（POTX）を適用してデザインを変更
+> 3. **編集**: 既存のPPTXの内容を編集（テーマ変更なし）
+
+### テンプレートについて
 
 > プレゼンテーションのテンプレート（POTX）はお持ちですか？
 >
@@ -39,9 +53,10 @@ PowerPointプレゼンテーションをXML直接編集で作成。
 
 | シナリオ | ワークフロー |
 |----------|--------------|
-| テンプレート**あり** | [テンプレート適用](#テンプレート適用ワークフロー) |
-| テンプレート**なし** | [ベースから作成](#ベースから作成ワークフロー) |
-| 既存ファイル編集 | [編集ワークフロー](#編集ワークフロー) |
+| テンプレート**あり**（新規作成） | [テンプレート適用](#テンプレート適用ワークフロー) |
+| テンプレート**なし**（新規作成） | [ベースから作成](#ベースから作成ワークフロー) |
+| 既存PPTXにテーマ適用 | [既存ファイルへのテーマ適用](#既存ファイルへのテーマ適用ワークフロー) |
+| 既存ファイル編集（テーマ変更なし） | [編集ワークフロー](#編集ワークフロー) |
 
 ---
 
@@ -82,6 +97,50 @@ node scripts/edit-text.js ./work --slide 1 --placeholder ctrTitle --text "タイ
 
 # 4. パック
 node scripts/pack.js ./work output.pptx
+```
+
+---
+
+## 既存ファイルへのテーマ適用ワークフロー
+
+既存のPPTXファイルに新しいテーマ（POTX）を適用して、デザインを一新する。
+スライドの内容は保持しつつ、色、フォント、背景、レイアウトスタイルが変更される。
+
+```bash
+# 1. 既存PPTXを展開
+node scripts/unpack.js existing-presentation.pptx ./work
+
+# 2. 現在の構造を確認
+node scripts/list-slides.js ./work
+node scripts/list-layouts.js ./work
+
+# 3. テーマ（POTX）を適用
+node scripts/apply-potx.js ./work new-theme.potx
+
+# 4. 新しいレイアウトを確認
+node scripts/list-layouts.js ./work
+
+# 5. （オプション）内容の微調整
+# テーマ変更後、レイアウトの調整が必要な場合
+node scripts/edit-text.js ./work --slide 1 --placeholder title --text "調整後タイトル"
+
+# 6. パック
+node scripts/pack.js ./work themed-output.pptx
+```
+
+### 注意点
+
+- **レイアウトマッピング**: テンプレートに同じ番号のレイアウトがあれば自動的にマッピングされる。存在しない場合はレイアウト1（タイトルスライド）にフォールバック
+- **内容の保持**: テキストや画像などのコンテンツは保持されるが、位置やスタイルはテーマに依存
+- **確認推奨**: 適用後は必ずPowerPoint/Google Slidesで開いて表示を確認する
+
+### PPTXをテンプレートとして使用
+
+POTXファイルがなくても、PPTXファイルからテーマを抽出できる:
+
+```bash
+# PPTXファイルでも同じコマンドで適用可能
+node scripts/apply-potx.js ./work design-source.pptx
 ```
 
 ---
