@@ -12,6 +12,13 @@
       "path": "slide-studio",
       "description": "Create and modify PowerPoint presentations (PPTX) through direct XML manipulation. Use this skill when creating presentations from scratch, adding/editing slides, inserting images, or applying POTX templates. Supports all 11 standard Office slide layouts.",
       "tags": ["pptx", "powerpoint", "presentation", "office", "document"]
+    },
+    {
+      "id": "oxen-office",
+      "name": "Oxen Office",
+      "path": "oxen-office",
+      "description": "Inspect, build, and verify Office documents (PPTX, DOCX, XLSX) using the oxen CLI. Supports ASCII preview, JSON spec-based building, text extraction, and comprehensive document analysis.",
+      "tags": ["pptx", "docx", "xlsx", "office", "inspection", "build", "cli"]
     }
   ],
   "author": {
