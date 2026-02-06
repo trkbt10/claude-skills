@@ -1,0 +1,10 @@
+{
+  "name": "pptx-plus",
+  "version": "1.0.0",
+  "description": "Office document skills for Claude Code. PPTX creation via XML manipulation (Slide Studio) and PPTX/DOCX/XLSX inspection & building via CLI (Oxen Office).",
+  "author": {
+    "name": "trkbt10"
+  },
+  "repository": "https://github.com/trkbt10/claude-skills",
+  "license": "MIT"
+}
