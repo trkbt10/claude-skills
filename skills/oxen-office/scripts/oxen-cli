@@ -1874,8 +1874,9 @@ var {
   Help
 } = import__.default;
 
-// packages/@oxen-cli/pptx-cli/src/commands/info.ts
+// packages/@oxen-cli/pptx-cli/src/commands/loader.ts
 import * as fs from "fs/promises";
+import { extname } from "path";
 
 // node_modules/fflate/esm/index.mjs
 import { createRequire } from "module";
@@ -2847,6 +2848,9 @@ function toUint8Array2(content) {
 async function loadZipPackage(buffer) {
   const entries = readZipEntries(buffer);
   return Promise.resolve(createZipPackageFromEntries(entries));
+}
+function createEmptyZipPackage() {
+  return createZipPackageFromEntries(new Map);
 }
 function createZipPackageFromEntries(initialEntries) {
   const entries = new Map(initialEntries);
@@ -20182,6 +20186,2951 @@ async function loadPptxBundleFromBuffer(buffer) {
     presentationFile: zipPackage.asPresentationFile()
   };
 }
+
+// packages/@oxen-office/cfb/src/constants.ts
+var CFB_HEADER_SIZE = 512;
+var CFB_SIGNATURE = new Uint8Array([208, 207, 17, 224, 161, 177, 26, 225]);
+var MAXREGSECT = 4294967289;
+var ENDOFCHAIN = 4294967294;
+var FREESECT = 4294967295;
+var NOSTREAM = 4294967295;
+
+// packages/@oxen-office/cfb/src/errors.ts
+class CfbFormatError extends Error {
+  name = "CfbFormatError";
+}
+
+class CfbUnsupportedError extends Error {
+  name = "CfbUnsupportedError";
+}
+
+// packages/@oxen-office/cfb/src/parser/header.ts
+function bytesEqual(a, b) {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i2 = 0;i2 < a.length; i2++) {
+    if (a[i2] !== b[i2]) {
+      return false;
+    }
+  }
+  return true;
+}
+function parseCfbHeader(bytes, opts) {
+  if (!(bytes instanceof Uint8Array)) {
+    throw new CfbFormatError("openCfb: bytes must be a Uint8Array");
+  }
+  if (bytes.length < CFB_HEADER_SIZE) {
+    throw new CfbFormatError(`CFB header is truncated: ${bytes.length} bytes`);
+  }
+  const signature = bytes.subarray(0, 8);
+  if (!bytesEqual(signature, CFB_SIGNATURE)) {
+    throw new CfbFormatError("Invalid CFB signature");
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const majorVersion = view.getUint16(26, true);
+  if (majorVersion !== 3 && majorVersion !== 4) {
+    throw new CfbUnsupportedError(`Unsupported CFB major version: ${majorVersion}`);
+  }
+  const byteOrder = view.getUint16(28, true);
+  if (opts.strict && byteOrder !== 65534) {
+    throw new CfbFormatError(`Invalid byte order: 0x${byteOrder.toString(16)}`);
+  }
+  const sectorShift = view.getUint16(30, true);
+  const sectorSize = 1 << sectorShift;
+  if (majorVersion === 3 && sectorSize !== 512) {
+    throw new CfbFormatError(`Invalid sector size for major version 3: ${sectorSize}`);
+  }
+  if (majorVersion === 4 && sectorSize !== 4096) {
+    throw new CfbFormatError(`Invalid sector size for major version 4: ${sectorSize}`);
+  }
+  const miniSectorShift = view.getUint16(32, true);
+  const miniSectorSize = 1 << miniSectorShift;
+  if (opts.strict && miniSectorSize !== 64) {
+    throw new CfbFormatError(`Invalid mini sector size: ${miniSectorSize}`);
+  }
+  const numberOfFatSectors = view.getUint32(44, true);
+  const firstDirectorySector = view.getUint32(48, true);
+  const miniStreamCutoffSize = view.getUint32(56, true);
+  const firstMiniFatSector = view.getUint32(60, true);
+  const numberOfMiniFatSectors = view.getUint32(64, true);
+  const firstDifatSector = view.getUint32(68, true);
+  const numberOfDifatSectors = view.getUint32(72, true);
+  if (opts.strict && miniStreamCutoffSize !== 4096) {
+    throw new CfbFormatError(`Invalid mini stream cutoff size: ${miniStreamCutoffSize}`);
+  }
+  const difat = [];
+  for (let i2 = 0;i2 < 109; i2++) {
+    difat.push(view.getUint32(76 + i2 * 4, true));
+  }
+  return {
+    majorVersion,
+    sectorSize,
+    miniSectorSize,
+    miniStreamCutoffSize,
+    numberOfFatSectors,
+    firstDirectorySector,
+    firstMiniFatSector,
+    numberOfMiniFatSectors,
+    firstDifatSector,
+    numberOfDifatSectors,
+    difat
+  };
+}
+
+// packages/@oxen-office/cfb/src/parser/sector.ts
+function getSectorCount(bytes, header) {
+  const payloadBytes = bytes.length - CFB_HEADER_SIZE;
+  if (payloadBytes < 0) {
+    return 0;
+  }
+  return Math.floor(payloadBytes / header.sectorSize);
+}
+function assertRegSect(sector, sectorCount, where) {
+  if (sector === ENDOFCHAIN || sector === FREESECT) {
+    throw new CfbFormatError(`${where}: invalid sector value: 0x${sector.toString(16)}`);
+  }
+  if (sector > MAXREGSECT) {
+    throw new CfbFormatError(`${where}: sector is out of REGSECT range: 0x${sector.toString(16)}`);
+  }
+  if (sector >= sectorCount) {
+    throw new CfbFormatError(`${where}: sector is out of file range: ${sector} >= ${sectorCount}`);
+  }
+}
+function readSector(bytes, header, sectorNumber) {
+  const sectorCount = getSectorCount(bytes, header);
+  assertRegSect(sectorNumber, sectorCount, "readSector");
+  const start = (sectorNumber + 1) * header.sectorSize;
+  const end = start + header.sectorSize;
+  if (end > bytes.length) {
+    throw new CfbFormatError(`readSector: sector ${sectorNumber} is truncated`);
+  }
+  return bytes.subarray(start, end);
+}
+
+// packages/@oxen-office/cfb/src/parser/difat.ts
+function buildDifat(bytes, header, opts) {
+  const fatSectors = [];
+  for (const entry of header.difat) {
+    if (entry !== FREESECT) {
+      fatSectors.push(entry);
+    }
+  }
+  if (header.numberOfDifatSectors === 0) {
+    if (opts.strict && fatSectors.length !== header.numberOfFatSectors) {
+      throw new CfbFormatError(`DIFAT count mismatch: header lists ${fatSectors.length}, numberOfFatSectors=${header.numberOfFatSectors}`);
+    }
+    return fatSectors;
+  }
+  const chainState = { nextDifatSector: header.firstDifatSector };
+  const seen = new Set;
+  for (let i2 = 0;i2 < header.numberOfDifatSectors; i2++) {
+    const nextDifatSector = chainState.nextDifatSector;
+    if (nextDifatSector === ENDOFCHAIN) {
+      throw new CfbFormatError("DIFAT chain ended early");
+    }
+    if (seen.has(nextDifatSector)) {
+      throw new CfbFormatError("DIFAT chain has a cycle");
+    }
+    seen.add(nextDifatSector);
+    const sector = readSector(bytes, header, nextDifatSector);
+    const view = new DataView(sector.buffer, sector.byteOffset, sector.byteLength);
+    const entriesPerSector = header.sectorSize / 4;
+    for (let j = 0;j < entriesPerSector - 1; j++) {
+      const v = view.getUint32(j * 4, true);
+      if (v !== FREESECT) {
+        fatSectors.push(v);
+      }
+    }
+    chainState.nextDifatSector = view.getUint32((entriesPerSector - 1) * 4, true);
+  }
+  if (opts.strict && chainState.nextDifatSector !== ENDOFCHAIN) {
+    throw new CfbFormatError("DIFAT chain did not end with ENDOFCHAIN");
+  }
+  if (opts.strict && fatSectors.length !== header.numberOfFatSectors) {
+    throw new CfbFormatError(`DIFAT count mismatch: collected ${fatSectors.length}, numberOfFatSectors=${header.numberOfFatSectors}`);
+  }
+  return fatSectors;
+}
+
+// packages/@oxen-office/cfb/src/parser/fat.ts
+function buildFat(bytes, header, difat) {
+  const entries = [];
+  for (const sectorNumber of difat) {
+    const sector = readSector(bytes, header, sectorNumber);
+    const view = new DataView(sector.buffer, sector.byteOffset, sector.byteLength);
+    for (let i2 = 0;i2 < header.sectorSize; i2 += 4) {
+      entries.push(view.getUint32(i2, true));
+    }
+  }
+  if (entries.length === 0) {
+    throw new CfbFormatError("FAT is empty");
+  }
+  return new Uint32Array(entries);
+}
+function fatGet(fat, sectorNumber) {
+  const v = fat[sectorNumber];
+  return v === undefined ? FREESECT : v;
+}
+
+// packages/@oxen-office/cfb/src/parser/chain.ts
+function walkFatChain(fat, startSector, opts) {
+  const out = [];
+  const visited = new Set;
+  for (let steps = 0, current = startSector;steps < opts.maxSteps; steps++) {
+    if (current === ENDOFCHAIN) {
+      return out;
+    }
+    if (current === FREESECT) {
+      throw new CfbFormatError("FAT chain encountered FREESECT");
+    }
+    if (current > MAXREGSECT) {
+      throw new CfbFormatError(`FAT chain encountered reserved value: 0x${current.toString(16)}`);
+    }
+    if (visited.has(current)) {
+      throw new CfbFormatError("FAT chain has a cycle");
+    }
+    visited.add(current);
+    out.push(current);
+    current = fatGet(fat, current);
+  }
+  throw new CfbFormatError("FAT chain exceeded max steps");
+}
+function walkMiniFatChain(miniFat, startMiniSector, opts) {
+  const out = [];
+  const visited = new Set;
+  for (let steps = 0, current = startMiniSector;steps < opts.maxSteps; steps++) {
+    if (current === ENDOFCHAIN) {
+      return out;
+    }
+    if (current === FREESECT) {
+      throw new CfbFormatError("MiniFAT chain encountered FREESECT");
+    }
+    if (current > MAXREGSECT) {
+      throw new CfbFormatError(`MiniFAT chain encountered reserved value: 0x${current.toString(16)}`);
+    }
+    if (visited.has(current)) {
+      throw new CfbFormatError("MiniFAT chain has a cycle");
+    }
+    visited.add(current);
+    out.push(current);
+    current = miniFat[current] ?? FREESECT;
+  }
+  throw new CfbFormatError("MiniFAT chain exceeded max steps");
+}
+
+// packages/@oxen-office/cfb/src/parser/streams.ts
+function assertSafeSize(size, where) {
+  if (size < 0n) {
+    throw new CfbFormatError(`${where}: negative stream size`);
+  }
+  if (size > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new CfbFormatError(`${where}: stream size too large for JS: ${size.toString()}`);
+  }
+  return Number(size);
+}
+function requireWarningSink(opts, where) {
+  if (opts.strict) {
+    throw new Error(`${where}: internal error (warning sink required only in non-strict mode)`);
+  }
+  if (!opts.onWarning) {
+    throw new Error(`${where}: non-strict mode requires onWarning sink`);
+  }
+  return opts.onWarning;
+}
+function readFatChainOrFallback(params) {
+  const { fat, startSector, requiredSectors, opts } = params;
+  try {
+    return walkFatChain(fat, startSector, { maxSteps: requiredSectors + 1e4 });
+  } catch (err2) {
+    if (opts.strict) {
+      throw err2;
+    }
+    const onWarning = requireWarningSink(opts, "readStreamFromFat");
+    onWarning({
+      code: "FAT_CHAIN_INVALID",
+      where: "readStreamFromFat",
+      message: `FAT chain walk failed; returning zero-filled stream: ${err2 instanceof Error ? err2.message : String(err2)}`,
+      meta: { startSector, required: requiredSectors }
+    });
+    return [];
+  }
+}
+function readMiniFatChainOrFallback(params) {
+  const { miniFat, startMiniSector, requiredSectors, opts } = params;
+  try {
+    return walkMiniFatChain(miniFat, startMiniSector, { maxSteps: requiredSectors + 1e4 });
+  } catch (err2) {
+    if (opts.strict) {
+      throw err2;
+    }
+    const onWarning = requireWarningSink(opts, "readStreamFromMiniFat");
+    onWarning({
+      code: "MINIFAT_CHAIN_INVALID",
+      where: "readStreamFromMiniFat",
+      message: `MiniFAT chain walk failed; returning zero-filled stream: ${err2 instanceof Error ? err2.message : String(err2)}`,
+      meta: { startMiniSector, required: requiredSectors }
+    });
+    return [];
+  }
+}
+function readStreamFromFat(params) {
+  const { bytes, header, fat, startSector, streamSize, opts } = params;
+  const size = assertSafeSize(streamSize, "readStreamFromFat");
+  if (size === 0) {
+    return new Uint8Array;
+  }
+  if (startSector === ENDOFCHAIN) {
+    throw new CfbFormatError("readStreamFromFat: non-empty stream has ENDOFCHAIN as starting sector");
+  }
+  const requiredSectors = Math.ceil(size / header.sectorSize);
+  const out = new Uint8Array(requiredSectors * header.sectorSize);
+  const chain = readFatChainOrFallback({ fat, startSector, requiredSectors, opts });
+  if (chain.length < requiredSectors) {
+    try {
+      throw new CfbFormatError(`readStreamFromFat: chain too short: ${chain.length} < ${requiredSectors}`);
+    } catch (err2) {
+      if (opts.strict) {
+        throw err2;
+      }
+      const onWarning = requireWarningSink(opts, "readStreamFromFat");
+      onWarning({
+        code: "FAT_CHAIN_TOO_SHORT",
+        where: "readStreamFromFat",
+        message: `FAT chain too short; zero-filling missing sectors: chain=${chain.length}, required=${requiredSectors}`,
+        meta: { chain: chain.length, required: requiredSectors, startSector }
+      });
+    }
+  } else if (chain.length !== requiredSectors) {
+    try {
+      throw new CfbFormatError(`readStreamFromFat: chain length mismatch: ${chain.length} !== ${requiredSectors}`);
+    } catch (err2) {
+      if (opts.strict) {
+        throw err2;
+      }
+      const onWarning = requireWarningSink(opts, "readStreamFromFat");
+      onWarning({
+        code: "FAT_CHAIN_LENGTH_MISMATCH",
+        where: "readStreamFromFat",
+        message: `FAT chain length mismatch; using first required sectors: chain=${chain.length}, required=${requiredSectors}`,
+        meta: { chain: chain.length, required: requiredSectors, startSector }
+      });
+    }
+  }
+  for (let i2 = 0;i2 < requiredSectors; i2++) {
+    const sectorNumber = chain[i2];
+    if (sectorNumber === undefined) {
+      break;
+    }
+    try {
+      out.set(readSector(bytes, header, sectorNumber), i2 * header.sectorSize);
+    } catch (err2) {
+      if (opts.strict) {
+        throw err2;
+      }
+      const onWarning = requireWarningSink(opts, "readStreamFromFat");
+      onWarning({
+        code: "FAT_SECTOR_READ_FAILED",
+        where: "readStreamFromFat",
+        message: `Failed to read FAT sector; truncating stream read and zero-filling remainder: sector=${sectorNumber}`,
+        meta: { sectorNumber, sectorIndex: i2, startSector }
+      });
+      break;
+    }
+  }
+  return out.subarray(0, size);
+}
+function readDirectoryStreamBytes(bytes, header, fat) {
+  if (header.firstDirectorySector === ENDOFCHAIN) {
+    throw new CfbFormatError("Directory stream missing (firstDirectorySector=ENDOFCHAIN)");
+  }
+  const chain = walkFatChain(fat, header.firstDirectorySector, { maxSteps: 1e6 });
+  if (chain.length === 0) {
+    throw new CfbFormatError("Directory stream chain is empty");
+  }
+  const out = new Uint8Array(chain.length * header.sectorSize);
+  for (const [i2, sectorNumber] of chain.entries()) {
+    out.set(readSector(bytes, header, sectorNumber), i2 * header.sectorSize);
+  }
+  return out;
+}
+function readStreamFromMiniFat(params) {
+  const { miniFat, miniStreamBytes, header, startMiniSector, streamSize, opts } = params;
+  const size = assertSafeSize(streamSize, "readStreamFromMiniFat");
+  if (size === 0) {
+    return new Uint8Array;
+  }
+  const requiredSectors = Math.ceil(size / header.miniSectorSize);
+  const out = new Uint8Array(requiredSectors * header.miniSectorSize);
+  const chain = readMiniFatChainOrFallback({ miniFat, startMiniSector, requiredSectors, opts });
+  if (chain.length < requiredSectors) {
+    try {
+      throw new CfbFormatError(`readStreamFromMiniFat: chain too short: ${chain.length} < ${requiredSectors}`);
+    } catch (err2) {
+      if (opts.strict) {
+        throw err2;
+      }
+      const onWarning = requireWarningSink(opts, "readStreamFromMiniFat");
+      onWarning({
+        code: "MINIFAT_CHAIN_TOO_SHORT",
+        where: "readStreamFromMiniFat",
+        message: `MiniFAT chain too short; zero-filling missing mini sectors: chain=${chain.length}, required=${requiredSectors}`,
+        meta: { chain: chain.length, required: requiredSectors, startMiniSector }
+      });
+    }
+  } else if (chain.length !== requiredSectors) {
+    try {
+      throw new CfbFormatError(`readStreamFromMiniFat: chain length mismatch: ${chain.length} !== ${requiredSectors}`);
+    } catch (err2) {
+      if (opts.strict) {
+        throw err2;
+      }
+      const onWarning = requireWarningSink(opts, "readStreamFromMiniFat");
+      onWarning({
+        code: "MINIFAT_CHAIN_LENGTH_MISMATCH",
+        where: "readStreamFromMiniFat",
+        message: `MiniFAT chain length mismatch; using first required mini sectors: chain=${chain.length}, required=${requiredSectors}`,
+        meta: { chain: chain.length, required: requiredSectors, startMiniSector }
+      });
+    }
+  }
+  for (let i2 = 0;i2 < requiredSectors; i2++) {
+    const miniSectorNumber = chain[i2];
+    if (miniSectorNumber === undefined) {
+      break;
+    }
+    const start = miniSectorNumber * header.miniSectorSize;
+    const end = start + header.miniSectorSize;
+    if (end > miniStreamBytes.length) {
+      try {
+        throw new CfbFormatError("readStreamFromMiniFat: mini stream is truncated");
+      } catch (err2) {
+        if (opts.strict) {
+          throw err2;
+        }
+        const onWarning = requireWarningSink(opts, "readStreamFromMiniFat");
+        onWarning({
+          code: "MINISTREAM_TRUNCATED",
+          where: "readStreamFromMiniFat",
+          message: "Mini stream is truncated; truncating read and zero-filling remainder.",
+          meta: { miniStreamBytes: miniStreamBytes.length, end, startMiniSector, miniSectorNumber, miniSectorIndex: i2 }
+        });
+      }
+      break;
+    }
+    out.set(miniStreamBytes.subarray(start, end), i2 * header.miniSectorSize);
+  }
+  return out.subarray(0, size);
+}
+
+// packages/@oxen-office/cfb/src/parser/directory.ts
+function parseDirectoryEntryType(v) {
+  switch (v) {
+    case 0:
+      return "unused";
+    case 1:
+      return "storage";
+    case 2:
+      return "stream";
+    case 5:
+      return "root";
+    default:
+      throw new CfbFormatError(`Unknown directory entry type: 0x${v.toString(16)}`);
+  }
+}
+function parseUtf16leName(bytes, nameLenBytes) {
+  if (nameLenBytes < 2) {
+    return "";
+  }
+  if (nameLenBytes > 64) {
+    throw new CfbFormatError(`Invalid directory name length: ${nameLenBytes}`);
+  }
+  const dataBytes = nameLenBytes - 2;
+  const nameBytes = bytes.subarray(0, dataBytes);
+  const decoder = new TextDecoder("utf-16le");
+  return decoder.decode(nameBytes);
+}
+function parseDirectoryStream(directoryBytes) {
+  if (directoryBytes.length % 128 !== 0) {}
+  const entries = [];
+  const view = new DataView(directoryBytes.buffer, directoryBytes.byteOffset, directoryBytes.byteLength);
+  const count = Math.floor(directoryBytes.length / 128);
+  for (let i2 = 0;i2 < count; i2++) {
+    const base = i2 * 128;
+    const nameBytes = directoryBytes.subarray(base, base + 64);
+    const nameLenBytes = view.getUint16(base + 64, true);
+    const objectType = view.getUint8(base + 66);
+    const leftSiblingId = view.getUint32(base + 68, true);
+    const rightSiblingId = view.getUint32(base + 72, true);
+    const childId = view.getUint32(base + 76, true);
+    const startingSector = view.getUint32(base + 116, true);
+    const streamSize = view.getBigUint64(base + 120, true);
+    const type = parseDirectoryEntryType(objectType);
+    const name = parseUtf16leName(nameBytes, nameLenBytes);
+    entries.push({
+      id: i2,
+      name,
+      type,
+      leftSiblingId,
+      rightSiblingId,
+      childId,
+      startingSector,
+      streamSize
+    });
+  }
+  return entries;
+}
+
+// packages/@oxen-office/cfb/src/runner.ts
+function normalizeName(name) {
+  return name.toUpperCase();
+}
+function assertEntryId(entries, id, where) {
+  const entry = entries[id];
+  if (!entry) {
+    throw new CfbFormatError(`${where}: entry id out of range: ${id}`);
+  }
+  return entry;
+}
+function walkRbTreeInOrder(entries, rootId) {
+  const out = [];
+  const visited = new Set;
+  function visit(id) {
+    if (id === NOSTREAM) {
+      return;
+    }
+    if (visited.has(id)) {
+      throw new CfbFormatError("Directory tree has a cycle");
+    }
+    visited.add(id);
+    const entry = assertEntryId(entries, id, "Directory tree");
+    visit(entry.leftSiblingId);
+    out.push(id);
+    visit(entry.rightSiblingId);
+  }
+  visit(rootId);
+  return out;
+}
+function buildChildIndex(entries, storageId) {
+  const storage = assertEntryId(entries, storageId, "buildChildIndex");
+  if (storage.type !== "root" && storage.type !== "storage") {
+    throw new CfbFormatError(`buildChildIndex: entry ${storageId} is not a storage/root`);
+  }
+  if (storage.childId === NOSTREAM) {
+    return new Map;
+  }
+  const childIds = walkRbTreeInOrder(entries, storage.childId);
+  const map = new Map;
+  for (const childId of childIds) {
+    const child = assertEntryId(entries, childId, "buildChildIndex");
+    if (child.type !== "storage" && child.type !== "stream") {
+      continue;
+    }
+    const key = normalizeName(child.name);
+    if (map.has(key)) {
+      throw new CfbFormatError(`Duplicate child name in storage ${storageId}: ${child.name}`);
+    }
+    map.set(key, childId);
+  }
+  return map;
+}
+function createCfbRunner(args) {
+  const childIndexByStorageId = new Map;
+  function getEntryById(id) {
+    return args.directory[id];
+  }
+  function getChildIndex(storageId) {
+    const cached = childIndexByStorageId.get(storageId);
+    if (cached) {
+      return cached;
+    }
+    const built = buildChildIndex(args.directory, storageId);
+    childIndexByStorageId.set(storageId, built);
+    return built;
+  }
+  function getEntry(path) {
+    if (!Array.isArray(path) || path.length === 0) {
+      throw new CfbFormatError("getEntry: path must be a non-empty string[]");
+    }
+    const cursor = { currentId: 0 };
+    for (let i2 = 0;i2 < path.length; i2++) {
+      const part = path[i2];
+      if (!part) {
+        throw new CfbFormatError("getEntry: path contains empty segment");
+      }
+      const index = getChildIndex(cursor.currentId);
+      const nextId = index.get(normalizeName(part));
+      if (nextId === undefined) {
+        throw new CfbFormatError(`Path not found: ${path.join("/")}`);
+      }
+      const entry = assertEntryId(args.directory, nextId, "getEntry");
+      const isLast = i2 === path.length - 1;
+      if (!isLast && entry.type !== "storage") {
+        throw new CfbFormatError(`Path segment is not a storage: ${part}`);
+      }
+      cursor.currentId = nextId;
+    }
+    return assertEntryId(args.directory, cursor.currentId, "getEntry");
+  }
+  function list(path) {
+    const storage = path ? getEntry(path) : assertEntryId(args.directory, 0, "list");
+    if (storage.type !== "root" && storage.type !== "storage") {
+      throw new CfbFormatError("list: path must refer to a storage/root");
+    }
+    const index = getChildIndex(storage.id);
+    const out = [];
+    for (const id of index.values()) {
+      const entry = assertEntryId(args.directory, id, "list");
+      if (entry.type === "storage" || entry.type === "stream") {
+        out.push({ name: entry.name, type: entry.type });
+      }
+    }
+    out.sort((a, b) => a.name.localeCompare(b.name));
+    return out;
+  }
+  function readStreamByEntry(entry) {
+    if (entry.type !== "stream") {
+      throw new CfbFormatError(`readStream: entry is not a stream: ${entry.name}`);
+    }
+    const isMini = entry.streamSize < BigInt(args.header.miniStreamCutoffSize);
+    if (!isMini) {
+      return readStreamFromFat({ bytes: args.bytes, header: args.header, fat: args.fat, startSector: entry.startingSector, streamSize: entry.streamSize, opts: { strict: args.strict, ...args.onWarning ? { onWarning: args.onWarning } : {} } });
+    }
+    if (!args.miniFat || !args.miniStreamBytes) {
+      throw new CfbFormatError(`readStream: mini stream data not available for ${entry.name}`);
+    }
+    if (entry.startingSector === ENDOFCHAIN && entry.streamSize !== 0n) {
+      throw new CfbFormatError("readStream: non-empty mini stream has ENDOFCHAIN as starting sector");
+    }
+    return readStreamFromMiniFat({ miniFat: args.miniFat, miniStreamBytes: args.miniStreamBytes, header: args.header, startMiniSector: entry.startingSector, streamSize: entry.streamSize, opts: { strict: args.strict, ...args.onWarning ? { onWarning: args.onWarning } : {} } });
+  }
+  function readStream(path) {
+    const entry = getEntry(path);
+    return readStreamByEntry(entry);
+  }
+  function readStreamText(path, enc) {
+    const bytes = readStream(path);
+    const decoder = new TextDecoder(enc);
+    return decoder.decode(bytes);
+  }
+  const root = assertEntryId(args.directory, 0, "createCfbRunner");
+  if (args.strict && root.type !== "root") {
+    throw new CfbFormatError("Directory entry 0 must be the root entry");
+  }
+  return {
+    header: args.header,
+    directory: args.directory,
+    getEntryById,
+    getEntry,
+    list,
+    readStream,
+    readStreamText
+  };
+}
+
+// packages/@oxen-office/cfb/src/warnings.ts
+function warnCfbOrThrow(opts, warning, strictError) {
+  if (opts.strict) {
+    throw strictError;
+  }
+  if (!opts.onWarning) {
+    throw new Error(`non-strict CFB mode requires onWarning sink: ${warning.code} (${warning.where})`);
+  }
+  opts.onWarning(warning);
+}
+
+// packages/@oxen-office/cfb/src/index.ts
+function walkFatChainOrEmpty(args) {
+  try {
+    return walkFatChain(args.fat, args.startSector, { maxSteps: args.expectedSectors + 1e4 });
+  } catch (err2) {
+    warnCfbOrThrow(args.opts, {
+      code: "MINIFAT_CHAIN_INVALID",
+      where: args.where,
+      message: `MiniFAT chain walk failed; treating MiniFAT as empty: ${err2 instanceof Error ? err2.message : String(err2)}`,
+      meta: { firstMiniFatSector: args.startSector, miniFatSectors: args.expectedSectors }
+    }, err2 instanceof Error ? err2 : new Error(String(err2)));
+    return [];
+  }
+}
+function tryReadSectorOrTruncate(args) {
+  try {
+    return readSector(args.bytes, args.header, args.sectorNumber);
+  } catch (err2) {
+    warnCfbOrThrow(args.opts, {
+      code: "FAT_SECTOR_READ_FAILED",
+      where: args.where,
+      message: `Failed to read MiniFAT sector; truncating MiniFAT: sector=${args.sectorNumber}`,
+      meta: { sectorNumber: args.sectorNumber, sectorIndex: args.sectorIndex }
+    }, err2 instanceof Error ? err2 : new Error(String(err2)));
+    return;
+  }
+}
+function openCfb(bytes, opts) {
+  const strict = opts?.strict ?? true;
+  const onWarning = opts?.onWarning;
+  if (!strict && !onWarning) {
+    throw new Error("openCfb: non-strict mode requires onWarning sink");
+  }
+  const header = parseCfbHeader(bytes, { strict });
+  const difat = buildDifat(bytes, header, { strict });
+  const fat = buildFat(bytes, header, difat);
+  const directoryBytes = readDirectoryStreamBytes(bytes, header, fat);
+  const directory = parseDirectoryStream(directoryBytes);
+  const mini = {};
+  if (header.firstMiniFatSector !== ENDOFCHAIN) {
+    const miniFatSectors = header.numberOfMiniFatSectors;
+    const optsForRead = { strict, ...onWarning ? { onWarning } : {} };
+    const chain = walkFatChainOrEmpty({ fat, startSector: header.firstMiniFatSector, expectedSectors: miniFatSectors, opts: optsForRead, where: "openCfb:MiniFAT" });
+    if (chain.length < miniFatSectors) {
+      warnCfbOrThrow(optsForRead, {
+        code: "MINIFAT_CHAIN_TOO_SHORT",
+        where: "openCfb:MiniFAT",
+        message: `MiniFAT chain too short; truncating: chain=${chain.length}, required=${miniFatSectors}`,
+        meta: { chain: chain.length, required: miniFatSectors }
+      }, new CfbFormatError(`MiniFAT chain too short: ${chain.length} < ${miniFatSectors}`));
+    } else if (chain.length !== miniFatSectors) {
+      warnCfbOrThrow(optsForRead, {
+        code: "MINIFAT_CHAIN_LENGTH_MISMATCH",
+        where: "openCfb:MiniFAT",
+        message: `MiniFAT chain length mismatch; using first required sectors: chain=${chain.length}, required=${miniFatSectors}`,
+        meta: { chain: chain.length, required: miniFatSectors }
+      }, new CfbFormatError(`MiniFAT chain length mismatch: ${chain.length} !== ${miniFatSectors}`));
+    }
+    const entryCount = miniFatSectors * header.sectorSize / 4;
+    const entries = new Uint32Array(entryCount);
+    entries.fill(ENDOFCHAIN);
+    for (let sectorIndex = 0;sectorIndex < miniFatSectors; sectorIndex++) {
+      const sectorNumber = chain[sectorIndex];
+      if (sectorNumber === undefined) {
+        break;
+      }
+      const sectorBytes = tryReadSectorOrTruncate({ bytes, header, sectorNumber, sectorIndex, opts: optsForRead, where: "openCfb:MiniFAT" });
+      if (!sectorBytes) {
+        break;
+      }
+      const view = new DataView(sectorBytes.buffer, sectorBytes.byteOffset, sectorBytes.byteLength);
+      const baseEntry = sectorIndex * header.sectorSize / 4;
+      for (let i2 = 0;i2 < header.sectorSize; i2 += 4) {
+        const idx = baseEntry + i2 / 4;
+        if (idx >= entries.length) {
+          break;
+        }
+        entries[idx] = view.getUint32(i2, true);
+      }
+    }
+    mini.miniFat = entries;
+  }
+  const root = directory[0];
+  if (root && root.type === "root" && root.streamSize > 0n) {
+    mini.miniStreamBytes = readStreamFromFat({ bytes, header, fat, startSector: root.startingSector, streamSize: root.streamSize, opts: { strict, ...onWarning ? { onWarning } : {} } });
+  }
+  return createCfbRunner({ bytes, header, directory, fat, miniFat: mini.miniFat, miniStreamBytes: mini.miniStreamBytes, strict, ...onWarning ? { onWarning } : {} });
+}
+
+// packages/@oxen-office/ppt/src/parse-context.ts
+function isStrict(ctx) {
+  return ctx.mode === "strict";
+}
+function warnOrThrow(ctx, warning, strictError) {
+  if (isStrict(ctx)) {
+    throw strictError;
+  }
+  if (!ctx.warn) {
+    throw new Error(`lenient mode requires warn sink: ${warning.code} (${warning.where})`);
+  }
+  ctx.warn(warning);
+}
+
+// packages/@oxen-office/ppt/src/warnings.ts
+function createPptWarningCollector() {
+  const warnings = [];
+  return {
+    warn: (warning) => {
+      warnings.push(warning);
+    },
+    warnings
+  };
+}
+
+// packages/@oxen-office/ppt/src/records/record-types.ts
+var RT = {
+  DocumentContainer: 1000,
+  DocumentAtom: 1001,
+  EndDocumentAtom: 1002,
+  SlideListWithText: 4080,
+  SlidePersistAtom: 1011,
+  Environment: 1010,
+  SlideContainer: 1006,
+  SlideAtom: 1007,
+  NotesContainer: 1008,
+  NotesAtom: 1009,
+  MainMasterContainer: 1016,
+  MainMasterAtom: 1017,
+  TextHeaderAtom: 3999,
+  TextCharsAtom: 4000,
+  StyleTextPropAtom: 4001,
+  TextRulerAtom: 4002,
+  MasterTextPropAtom: 4003,
+  TextBookmarkAtom: 4007,
+  TextBytesAtom: 4008,
+  TextSpecialInfoAtom: 4010,
+  InteractiveInfoAtom: 4082,
+  InteractiveInfoInstance: 4083,
+  TxInteractiveInfoAtom: 4063,
+  FontEntityAtom: 4023,
+  FontCollection: 2005,
+  OfficeArtDggContainer: 61440,
+  OfficeArtBStoreContainer: 61441,
+  OfficeArtDgContainer: 61442,
+  OfficeArtSpgrContainer: 61443,
+  OfficeArtSpContainer: 61444,
+  OfficeArtFDGG: 61446,
+  OfficeArtBStoreEntry: 61447,
+  OfficeArtFDG: 61448,
+  OfficeArtFSPGR: 61449,
+  OfficeArtFSP: 61450,
+  OfficeArtFOPT: 61451,
+  OfficeArtClientTextbox: 61453,
+  OfficeArtChildAnchor: 61455,
+  OfficeArtClientAnchor: 61456,
+  OfficeArtClientData: 61457,
+  OfficeArtSecondaryFOPT: 61729,
+  OfficeArtTertiaryFOPT: 61730,
+  OfficeArtBlipEMF: 61466,
+  OfficeArtBlipWMF: 61467,
+  OfficeArtBlipPICT: 61468,
+  OfficeArtBlipJPEG1: 61469,
+  OfficeArtBlipPNG: 61470,
+  OfficeArtBlipDIB: 61471,
+  OfficeArtBlipTIFF: 61481,
+  OfficeArtBlipJPEG2: 61482,
+  CurrentUserAtom: 4086,
+  UserEditAtom: 4085,
+  PersistDirectoryAtom: 6002,
+  ColorSchemeAtom: 2032,
+  ExternalHyperlinkContainer: 4055,
+  ExternalHyperlinkAtom: 4051,
+  ExternalOleLink: 4049,
+  ExObjListContainer: 1033,
+  ExObjListAtom: 1034,
+  CString: 4026,
+  PP10ShapeGroup: 5097,
+  PPDrawing: 1036,
+  HeadersFootersContainer: 4057,
+  HeadersFootersAtom: 4058,
+  NotesTextViewInfoAtom: 3994,
+  ExOleEmbedContainer: 4044,
+  ExOleEmbedAtom: 4045,
+  ExOleObjAtom: 4035,
+  ExternalOleObjectAtom: 4033
+};
+
+// packages/@oxen-office/ppt/src/records/record-reader.ts
+var RECORD_HEADER_SIZE = 8;
+function formatHex(value) {
+  return `0x${value.toString(16).padStart(4, "0")}`;
+}
+function readPptRecord(bytes, offset) {
+  if (!Number.isInteger(offset) || offset < 0) {
+    throw new Error(`Invalid PPT record offset: ${offset}`);
+  }
+  if (offset + RECORD_HEADER_SIZE > bytes.length) {
+    throw new Error(`Truncated PPT record header at offset ${offset} (need ${RECORD_HEADER_SIZE} bytes, have ${bytes.length - offset})`);
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset + offset, RECORD_HEADER_SIZE);
+  const verAndInstance = view.getUint16(0, true);
+  const recVer = verAndInstance & 15;
+  const recInstance = verAndInstance >> 4 & 4095;
+  const recType = view.getUint16(2, true);
+  const recLen = view.getUint32(4, true);
+  const dataStart = offset + RECORD_HEADER_SIZE;
+  const dataEnd = dataStart + recLen;
+  if (dataEnd > bytes.length) {
+    throw new Error(`Truncated PPT record data for type ${formatHex(recType)} at offset ${offset} (need ${recLen} bytes, have ${bytes.length - dataStart})`);
+  }
+  return {
+    recVer,
+    recInstance,
+    recType,
+    recLen,
+    data: bytes.subarray(dataStart, dataEnd),
+    offset
+  };
+}
+
+// packages/@oxen-office/ppt/src/records/container-parser.ts
+function parsePptRecordTree(bytes, offset) {
+  const record = readPptRecord(bytes, offset);
+  if (record.recVer === 15) {
+    const children = parseContainerChildren(bytes, offset + RECORD_HEADER_SIZE, offset + RECORD_HEADER_SIZE + record.recLen);
+    return { ...record, children };
+  }
+  return record;
+}
+function parseContainerChildren(bytes, startOffset, endOffset) {
+  const children = [];
+  let pos = startOffset;
+  while (pos + RECORD_HEADER_SIZE <= endOffset) {
+    const child = parsePptRecordTree(bytes, pos);
+    children.push(child);
+    pos += RECORD_HEADER_SIZE + child.recLen;
+  }
+  return children;
+}
+
+// packages/@oxen-office/ppt/src/records/record-iterator.ts
+function findChildByType(children, recType) {
+  return children.find((c) => c.recType === recType);
+}
+function findChildrenByType(children, recType) {
+  return children.filter((c) => c.recType === recType);
+}
+
+// packages/@oxen-office/ppt/src/records/atoms/slide.ts
+function parseSlidePersistAtom(record) {
+  if (record.recType !== RT.SlidePersistAtom) {
+    throw new Error(`Expected SlidePersistAtom (0x03F3), got 0x${record.recType.toString(16)}`);
+  }
+  const view = new DataView(record.data.buffer, record.data.byteOffset, record.data.byteLength);
+  return {
+    persistIdRef: view.getUint32(0, true),
+    flags: view.getUint32(4, true),
+    numberOfTexts: view.getInt32(8, true),
+    slideId: view.getInt32(12, true),
+    reserved: view.getUint32(16, true)
+  };
+}
+
+// packages/@oxen-office/ppt/src/stream/ppt-stream.ts
+function parseCurrentUserStream(bytes) {
+  const record = readPptRecord(bytes, 0);
+  if (record.recType !== RT.CurrentUserAtom) {
+    throw new Error(`Expected CurrentUserAtom (0x0FF6), got 0x${record.recType.toString(16)}`);
+  }
+  const view = new DataView(record.data.buffer, record.data.byteOffset, record.data.byteLength);
+  const offsetToCurrentEdit = view.getUint32(8, true);
+  return offsetToCurrentEdit;
+}
+function buildPersistDirectory(docStream, firstUserEditOffset, ctx) {
+  const persistDir = new Map;
+  let docPersistIdRef = 1;
+  let currentOffset = firstUserEditOffset;
+  const visited = new Set;
+  while (currentOffset !== 0 && !visited.has(currentOffset)) {
+    visited.add(currentOffset);
+    if (currentOffset + RECORD_HEADER_SIZE > docStream.length) {
+      warnOrThrow(ctx, { code: "PPT_PERSIST_OFFSET_INVALID", where: "buildPersistDirectory", message: `UserEditAtom offset ${currentOffset} out of range` }, new Error(`UserEditAtom offset ${currentOffset} out of range`));
+      break;
+    }
+    const userEditRecord = readPptRecord(docStream, currentOffset);
+    if (userEditRecord.recType !== RT.UserEditAtom) {
+      warnOrThrow(ctx, { code: "PPT_PERSIST_OFFSET_INVALID", where: "buildPersistDirectory", message: `Expected UserEditAtom at offset ${currentOffset}, got 0x${userEditRecord.recType.toString(16)}` }, new Error(`Expected UserEditAtom at offset ${currentOffset}`));
+      break;
+    }
+    const ueView = new DataView(userEditRecord.data.buffer, userEditRecord.data.byteOffset, userEditRecord.data.byteLength);
+    const offsetLastEdit = ueView.getUint32(8, true);
+    const offsetPersistDir = ueView.getUint32(12, true);
+    docPersistIdRef = ueView.getUint32(16, true);
+    if (offsetPersistDir + RECORD_HEADER_SIZE <= docStream.length) {
+      const pdRecord = readPptRecord(docStream, offsetPersistDir);
+      if (pdRecord.recType === RT.PersistDirectoryAtom) {
+        parsePersistDirectoryEntries(pdRecord, persistDir);
+      }
+    }
+    currentOffset = offsetLastEdit;
+  }
+  return { persistDir, docPersistIdRef };
+}
+function parsePersistDirectoryEntries(record, target) {
+  const view = new DataView(record.data.buffer, record.data.byteOffset, record.data.byteLength);
+  let offset = 0;
+  while (offset + 4 <= record.data.byteLength) {
+    const packed = view.getUint32(offset, true);
+    offset += 4;
+    const startPersistId = packed & 1048575;
+    const count = packed >> 20 & 4095;
+    for (let i2 = 0;i2 < count && offset + 4 <= record.data.byteLength; i2++) {
+      const streamOffset = view.getUint32(offset, true);
+      offset += 4;
+      target.set(startPersistId + i2, streamOffset);
+    }
+  }
+}
+function parsePptDocumentStream(docStream, currentUserStream, ctx) {
+  let firstUserEditOffset;
+  if (currentUserStream && currentUserStream.length > 0) {
+    firstUserEditOffset = parseCurrentUserStream(currentUserStream);
+  } else {
+    firstUserEditOffset = findLastUserEditAtom(docStream);
+  }
+  const { persistDir, docPersistIdRef } = buildPersistDirectory(docStream, firstUserEditOffset, ctx);
+  const docOffset = persistDir.get(docPersistIdRef);
+  if (docOffset === undefined) {
+    throw new Error(`DocumentContainer persist ID ${docPersistIdRef} not found in persist directory`);
+  }
+  const documentRecord = parsePptRecordTree(docStream, docOffset);
+  if (documentRecord.recType !== RT.DocumentContainer) {
+    throw new Error(`Expected DocumentContainer at offset ${docOffset}, got 0x${documentRecord.recType.toString(16)}`);
+  }
+  const slideListWithTexts = findChildrenByType(documentRecord.children ?? [], RT.SlideListWithText);
+  const slidePersists = [];
+  const notesPersists = [];
+  for (const slt of slideListWithTexts) {
+    const persistAtoms = findChildrenByType(slt.children ?? [], RT.SlidePersistAtom);
+    const parsedPersists = persistAtoms.map((a) => parseSlidePersistAtom(a));
+    if (slt.recInstance === 0) {
+      slidePersists.push(...parsedPersists);
+    } else if (slt.recInstance === 2) {
+      notesPersists.push(...parsedPersists);
+    }
+  }
+  const slideRecords = [];
+  for (const sp of slidePersists) {
+    const slideOffset = persistDir.get(sp.persistIdRef);
+    if (slideOffset === undefined) {
+      warnOrThrow(ctx, { code: "PPT_SLIDE_PARSE_FAILED", where: "parsePptDocumentStream", message: `Slide persist ID ${sp.persistIdRef} not found`, meta: { persistId: sp.persistIdRef } }, new Error(`Slide persist ID ${sp.persistIdRef} not found`));
+      continue;
+    }
+    try {
+      const slideRecord = parsePptRecordTree(docStream, slideOffset);
+      slideRecords.push(slideRecord);
+    } catch (err2) {
+      warnOrThrow(ctx, { code: "PPT_SLIDE_PARSE_FAILED", where: "parsePptDocumentStream", message: `Failed to parse slide at offset ${slideOffset}: ${err2 instanceof Error ? err2.message : String(err2)}` }, err2 instanceof Error ? err2 : new Error(String(err2)));
+    }
+  }
+  const noteRecords = [];
+  for (const np of notesPersists) {
+    const notesOffset = persistDir.get(np.persistIdRef);
+    if (notesOffset === undefined)
+      continue;
+    try {
+      const notesRecord = parsePptRecordTree(docStream, notesOffset);
+      noteRecords.push(notesRecord);
+    } catch {}
+  }
+  const masterRecords = [];
+  for (const [, offset] of persistDir) {
+    if (offset + RECORD_HEADER_SIZE > docStream.length)
+      continue;
+    try {
+      const rec = readPptRecord(docStream, offset);
+      if (rec.recType === RT.MainMasterContainer) {
+        masterRecords.push(parsePptRecordTree(docStream, offset));
+      }
+    } catch {}
+  }
+  return {
+    documentRecord,
+    slideRecords,
+    slidePersists,
+    persistDirectory: persistDir,
+    noteRecords,
+    masterRecords
+  };
+}
+function findLastUserEditAtom(docStream) {
+  for (let offset = docStream.length - RECORD_HEADER_SIZE;offset >= 0; offset--) {
+    try {
+      const record = readPptRecord(docStream, offset);
+      if (record.recType === RT.UserEditAtom && record.recLen >= 20 && record.recLen <= 32) {
+        return offset;
+      }
+    } catch {}
+  }
+  throw new Error("Could not find UserEditAtom in PowerPoint Document stream");
+}
+
+// packages/@oxen-office/ppt/src/records/atoms/picture.ts
+var BLIP_INFO = {
+  [RT.OfficeArtBlipJPEG1]: { contentType: "image/jpeg", headerSize1: 17, headerSize2: 33 },
+  [RT.OfficeArtBlipJPEG2]: { contentType: "image/jpeg", headerSize1: 17, headerSize2: 33 },
+  [RT.OfficeArtBlipPNG]: { contentType: "image/png", headerSize1: 17, headerSize2: 33 },
+  [RT.OfficeArtBlipDIB]: { contentType: "image/bmp", headerSize1: 17, headerSize2: 33 },
+  [RT.OfficeArtBlipEMF]: { contentType: "image/x-emf", headerSize1: 50, headerSize2: 66 },
+  [RT.OfficeArtBlipWMF]: { contentType: "image/x-wmf", headerSize1: 50, headerSize2: 66 },
+  [RT.OfficeArtBlipTIFF]: { contentType: "image/tiff", headerSize1: 17, headerSize2: 33 },
+  [RT.OfficeArtBlipPICT]: { contentType: "image/pict", headerSize1: 50, headerSize2: 66 }
+};
+function isBlipRecordType(recType) {
+  return recType in BLIP_INFO;
+}
+function parseBlipRecord(record) {
+  const info = BLIP_INFO[record.recType];
+  if (!info) {
+    throw new Error(`Unknown BLIP record type: 0x${record.recType.toString(16)}`);
+  }
+  const headerSize = record.recInstance & 1 ? info.headerSize2 : info.headerSize1;
+  const dataStart = Math.min(headerSize, record.data.byteLength);
+  const data = record.data.subarray(dataStart);
+  return {
+    contentType: info.contentType,
+    data
+  };
+}
+
+// packages/@oxen-office/ppt/src/stream/pictures-stream.ts
+function parsePicturesStream(bytes) {
+  const images = [];
+  let offset = 0;
+  let index = 0;
+  while (offset + RECORD_HEADER_SIZE < bytes.length) {
+    try {
+      const record = readPptRecord(bytes, offset);
+      if (isBlipRecordType(record.recType)) {
+        const blip = parseBlipRecord(record);
+        images.push({
+          index,
+          contentType: blip.contentType,
+          data: blip.data
+        });
+        index++;
+      }
+      offset += RECORD_HEADER_SIZE + record.recLen;
+    } catch {
+      break;
+    }
+  }
+  return images;
+}
+
+// packages/@oxen-office/ppt/src/records/atoms/document.ts
+var MASTER_UNIT_TO_EMU = 914400 / 576;
+function parseDocumentAtom(record) {
+  if (record.recType !== RT.DocumentAtom) {
+    throw new Error(`Expected DocumentAtom (0x03E9), got 0x${record.recType.toString(16)}`);
+  }
+  const view = new DataView(record.data.buffer, record.data.byteOffset, record.data.byteLength);
+  const slideSizeX = view.getInt32(0, true);
+  const slideSizeY = view.getInt32(4, true);
+  const notesSizeX = view.getInt32(8, true);
+  const notesSizeY = view.getInt32(12, true);
+  const serverZoomNumer = view.getInt32(16, true);
+  const serverZoomDenom = view.getInt32(20, true);
+  const notesMasterPersistIdRef = view.getUint32(24, true);
+  const handoutMasterPersistIdRef = view.getUint32(28, true);
+  const firstSlideNumber = view.getUint16(32, true);
+  const slideSizeType = view.getUint16(34, true);
+  return {
+    slideSizeX,
+    slideSizeY,
+    notesSizeX,
+    notesSizeY,
+    slideSizeXEmu: Math.round(slideSizeX * MASTER_UNIT_TO_EMU),
+    slideSizeYEmu: Math.round(slideSizeY * MASTER_UNIT_TO_EMU),
+    serverZoom: { numer: serverZoomNumer, denom: serverZoomDenom },
+    notesMasterPersistIdRef,
+    handoutMasterPersistIdRef,
+    firstSlideNumber,
+    slideSizeType
+  };
+}
+
+// packages/@oxen-office/ppt/src/records/atoms/text.ts
+function decodeTextCharsAtom(record) {
+  if (record.recType !== RT.TextCharsAtom) {
+    throw new Error(`Expected TextCharsAtom (0x0FA0), got 0x${record.recType.toString(16)}`);
+  }
+  return decodeUtf16Le(record.data);
+}
+function decodeTextBytesAtom(record) {
+  if (record.recType !== RT.TextBytesAtom) {
+    throw new Error(`Expected TextBytesAtom (0x0FA8), got 0x${record.recType.toString(16)}`);
+  }
+  const chars = [];
+  for (let i2 = 0;i2 < record.data.length; i2++) {
+    chars.push(String.fromCharCode(record.data[i2]));
+  }
+  return chars.join("");
+}
+function decodeUtf16Le(data) {
+  const chars = [];
+  for (let i2 = 0;i2 + 1 < data.length; i2 += 2) {
+    const code = data[i2] | data[i2 + 1] << 8;
+    chars.push(String.fromCharCode(code));
+  }
+  return chars.join("");
+}
+function parseStyleTextPropAtom(record, textLength) {
+  if (record.recType !== RT.StyleTextPropAtom) {
+    throw new Error(`Expected StyleTextPropAtom (0x0FA1), got 0x${record.recType.toString(16)}`);
+  }
+  const view = new DataView(record.data.buffer, record.data.byteOffset, record.data.byteLength);
+  let offset = 0;
+  function u162() {
+    const v = view.getUint16(offset, true);
+    offset += 2;
+    return v;
+  }
+  function s16() {
+    const v = view.getInt16(offset, true);
+    offset += 2;
+    return v;
+  }
+  function u32() {
+    const v = view.getUint32(offset, true);
+    offset += 4;
+    return v;
+  }
+  function canRead(n) {
+    return offset + n <= record.data.byteLength;
+  }
+  const paragraphRuns = [];
+  let totalParagraphChars = 0;
+  while (totalParagraphChars < textLength && canRead(4)) {
+    const charCount = u32();
+    totalParagraphChars += charCount;
+    if (!canRead(2))
+      break;
+    const indent = u162();
+    if (!canRead(4)) {
+      paragraphRuns.push({ charCount, indent });
+      break;
+    }
+    const mask = u32();
+    const run = { charCount, indent };
+    if (mask & 15 && canRead(2))
+      run.bulletFlags = u162();
+    if (mask & 128 && canRead(4))
+      run.bulletColor = u32();
+    if (mask & 16 && canRead(2))
+      run.bulletChar = u162();
+    if (mask & 32 && canRead(2))
+      run.bulletFontRef = u162();
+    if (mask & 64 && canRead(2))
+      run.bulletSize = u162();
+    if (mask & 2048 && canRead(2))
+      run.alignment = u162();
+    if (mask & 4096 && canRead(2))
+      run.lineSpacing = s16();
+    if (mask & 8192 && canRead(2))
+      run.spaceBefore = s16();
+    if (mask & 16384 && canRead(2))
+      run.spaceAfter = s16();
+    if (mask & 256 && canRead(2))
+      run.leftMargin = u162();
+    if (mask & 1024 && canRead(2)) {
+      u162();
+    }
+    if (mask & 32768 && canRead(2))
+      run.defaultTabSize = u162();
+    if (mask & 1048576 && canRead(2)) {
+      const count = u162();
+      const skipBytes = count * 4;
+      if (canRead(skipBytes))
+        offset += skipBytes;
+    }
+    if (mask & 65536 && canRead(2)) {
+      u162();
+    }
+    if (mask & 917504 && canRead(2)) {
+      u162();
+    }
+    if (mask & 2097152 && canRead(2)) {
+      u162();
+    }
+    paragraphRuns.push(run);
+  }
+  const characterRuns = [];
+  let totalCharChars = 0;
+  while (totalCharChars < textLength && canRead(4)) {
+    const charCount = u32();
+    totalCharChars += charCount;
+    if (!canRead(4)) {
+      characterRuns.push({ charCount });
+      break;
+    }
+    const mask = u32();
+    const run = { charCount };
+    if (mask & 65535 && canRead(2)) {
+      const flags = u162();
+      run.bold = !!(flags & 1);
+      run.italic = !!(flags & 2);
+      run.underline = !!(flags & 4);
+      run.strikethrough = !!(flags & 512);
+    }
+    if (mask & 65536 && canRead(2))
+      run.fontRef = u162();
+    if (mask & 2097152 && canRead(2)) {
+      u162();
+    }
+    if (mask & 4194304 && canRead(2)) {
+      u162();
+    }
+    if (mask & 8388608 && canRead(2)) {
+      u162();
+    }
+    if (mask & 131072 && canRead(2))
+      run.fontSize = u162();
+    if (mask & 262144 && canRead(4))
+      run.color = u32();
+    if (mask & 524288 && canRead(2)) {
+      u162();
+    }
+    if (mask & 1048576 && canRead(2)) {
+      u162();
+    }
+    if (mask & 16777216 && canRead(2)) {
+      u162();
+    }
+    if (mask & 33554432 && canRead(2)) {
+      u162();
+    }
+    if (mask & 67108864 && canRead(2)) {
+      u162();
+    }
+    characterRuns.push(run);
+  }
+  return { paragraphRuns, characterRuns };
+}
+function parseFontEntityAtom(record) {
+  if (record.recType !== RT.FontEntityAtom) {
+    throw new Error(`Expected FontEntityAtom (0x0FB7), got 0x${record.recType.toString(16)}`);
+  }
+  const nameEnd = Math.min(64, record.data.byteLength);
+  let name = "";
+  for (let i2 = 0;i2 + 1 < nameEnd; i2 += 2) {
+    const code = record.data[i2] | record.data[i2 + 1] << 8;
+    if (code === 0)
+      break;
+    name += String.fromCharCode(code);
+  }
+  const charset = record.data.byteLength > 64 ? record.data[64] : 0;
+  const flags = record.data.byteLength > 65 ? record.data[65] : 0;
+  const pitchAndFamily = record.data.byteLength > 66 ? record.data[66] : 0;
+  return { name, charset, flags, pitchAndFamily };
+}
+
+// packages/@oxen-office/ppt/src/records/atoms/color.ts
+function parseColorSchemeAtom(record) {
+  if (record.recType !== RT.ColorSchemeAtom) {
+    throw new Error(`Expected ColorSchemeAtom (0x07F0), got 0x${record.recType.toString(16)}`);
+  }
+  function readColor(offset) {
+    if (offset + 3 > record.data.byteLength)
+      return "000000";
+    const r = record.data[offset];
+    const g = record.data[offset + 1];
+    const b = record.data[offset + 2];
+    return toHex2(r) + toHex2(g) + toHex2(b);
+  }
+  return {
+    background: readColor(0),
+    textAndLines: readColor(4),
+    shadows: readColor(8),
+    titleText: readColor(12),
+    fills: readColor(16),
+    accent: readColor(20),
+    accentAndHyperlink: readColor(24),
+    accentAndFollowedHyperlink: readColor(28)
+  };
+}
+function toHex2(n) {
+  return n.toString(16).padStart(2, "0").toUpperCase();
+}
+var DEFAULT_COLOR_SCHEME = {
+  background: "FFFFFF",
+  textAndLines: "000000",
+  shadows: "808080",
+  titleText: "000000",
+  fills: "BBE0E3",
+  accent: "333399",
+  accentAndHyperlink: "0066CC",
+  accentAndFollowedHyperlink: "990099"
+};
+function resolveColor(value, scheme) {
+  const flag = value >> 24 & 255;
+  const r = value & 255;
+  const g = value >> 8 & 255;
+  const b = value >> 16 & 255;
+  if (flag === 254 || flag === 1) {
+    return resolveSchemeColor(r, scheme);
+  }
+  return toHex2(r) + toHex2(g) + toHex2(b);
+}
+function resolveSchemeColor(index, scheme) {
+  const colors = [
+    scheme.background,
+    scheme.textAndLines,
+    scheme.shadows,
+    scheme.titleText,
+    scheme.fills,
+    scheme.accent,
+    scheme.accentAndHyperlink,
+    scheme.accentAndFollowedHyperlink
+  ];
+  return colors[index] ?? "000000";
+}
+
+// packages/@oxen-office/ppt/src/extractor/color-resolver.ts
+function extractColorScheme(record) {
+  const children = record.children ?? [];
+  const colorSchemeAtom = findColorSchemeInTree(children);
+  if (colorSchemeAtom) {
+    return parseColorSchemeAtom(colorSchemeAtom);
+  }
+  return DEFAULT_COLOR_SCHEME;
+}
+function findColorSchemeInTree(records) {
+  const direct = findChildByType(records, RT.ColorSchemeAtom);
+  if (direct)
+    return direct;
+  for (const rec of records) {
+    if (rec.children) {
+      const nested = findChildByType(rec.children, RT.ColorSchemeAtom);
+      if (nested)
+        return nested;
+    }
+  }
+  return;
+}
+
+// packages/@oxen-office/ppt/src/records/atoms/shape.ts
+function parseOfficeArtFSP(record) {
+  if (record.recType !== RT.OfficeArtFSP) {
+    throw new Error(`Expected OfficeArtFSP (0xF00A), got 0x${record.recType.toString(16)}`);
+  }
+  const view = new DataView(record.data.buffer, record.data.byteOffset, record.data.byteLength);
+  const shapeId = view.getUint32(0, true);
+  const flags = view.getUint32(4, true);
+  return {
+    shapeId,
+    isGroup: !!(flags & 1),
+    isChild: !!(flags & 2),
+    isPatriarch: !!(flags & 4),
+    isDeleted: !!(flags & 8),
+    isOleShape: !!(flags & 16),
+    hasShapeType: !!(flags & 32),
+    hasAnchor: !!(flags & 64),
+    isConnector: !!(flags & 128),
+    flipH: !!(flags & 16384),
+    flipV: !!(flags & 32768)
+  };
+}
+var SHAPE_PROP = {
+  ROTATION: 4,
+  GROUP_LEFT: 320,
+  GROUP_TOP: 321,
+  GROUP_RIGHT: 322,
+  GROUP_BOTTOM: 323,
+  FILL_TYPE: 384,
+  FILL_COLOR: 385,
+  FILL_OPACITY: 386,
+  FILL_BACKGROUND_COLOR: 387,
+  FILL_STYLE_BOOL_PROPS: 447,
+  LINE_COLOR: 448,
+  LINE_OPACITY: 449,
+  LINE_WIDTH: 459,
+  LINE_DASH_STYLE: 462,
+  LINE_STYLE_BOOL_PROPS: 511,
+  TEXT_ID: 128,
+  TEXT_DIRECTION: 139,
+  TEXT_ANCHOR: 135,
+  TEXT_WORD_WRAP: 133,
+  TEXT_ROTATION: 138,
+  GEO_LEFT: 320,
+  GEO_TOP: 321,
+  GEO_RIGHT: 322,
+  GEO_BOTTOM: 323,
+  BLIP_ID: 260,
+  CROP_FROM_LEFT: 258,
+  CROP_FROM_TOP: 259,
+  CROP_FROM_RIGHT: 261,
+  CROP_FROM_BOTTOM: 262,
+  SHAPE_BOOL_PROPS: 959
+};
+function parseOfficeArtFOPT(record) {
+  if (record.recType !== RT.OfficeArtFOPT && record.recType !== RT.OfficeArtSecondaryFOPT && record.recType !== RT.OfficeArtTertiaryFOPT) {
+    throw new Error(`Expected OfficeArtFOPT, got 0x${record.recType.toString(16)}`);
+  }
+  const propertyCount = record.recInstance;
+  const view = new DataView(record.data.buffer, record.data.byteOffset, record.data.byteLength);
+  const properties = new Map;
+  const fixedSize = propertyCount * 6;
+  for (let i2 = 0;i2 < propertyCount && i2 * 6 + 5 < record.data.byteLength; i2++) {
+    const offset = i2 * 6;
+    const idRaw = view.getUint16(offset, true);
+    const value = view.getUint32(offset + 2, true);
+    const id = idRaw & 16383;
+    const isBlip = !!(idRaw & 16384);
+    const isComplex = !!(idRaw & 32768);
+    properties.set(id, { id, value, isBlip, isComplex });
+  }
+  let complexOffset = fixedSize;
+  for (const [, prop] of properties) {
+    if (prop.isComplex && prop.value > 0 && complexOffset + prop.value <= record.data.byteLength) {
+      const complexData = record.data.slice(complexOffset, complexOffset + prop.value);
+      properties.set(prop.id, { ...prop, complexData });
+      complexOffset += prop.value;
+    }
+  }
+  return properties;
+}
+function getShapeProp(props, id) {
+  return props.get(id)?.value;
+}
+function parseClientAnchor(record) {
+  if (record.recType !== RT.OfficeArtClientAnchor) {
+    throw new Error(`Expected OfficeArtClientAnchor (0xF010), got 0x${record.recType.toString(16)}`);
+  }
+  const view = new DataView(record.data.buffer, record.data.byteOffset, record.data.byteLength);
+  if (record.recInstance === 1 || record.data.byteLength >= 16) {
+    return {
+      top: view.getInt32(0, true),
+      left: view.getInt32(4, true),
+      right: view.getInt32(8, true),
+      bottom: view.getInt32(12, true)
+    };
+  }
+  return {
+    top: view.getInt16(0, true),
+    left: view.getInt16(2, true),
+    right: view.getInt16(4, true),
+    bottom: view.getInt16(6, true)
+  };
+}
+function parseChildAnchor(record) {
+  if (record.recType !== RT.OfficeArtChildAnchor) {
+    throw new Error(`Expected OfficeArtChildAnchor (0xF00F), got 0x${record.recType.toString(16)}`);
+  }
+  const view = new DataView(record.data.buffer, record.data.byteOffset, record.data.byteLength);
+  return {
+    left: view.getInt32(0, true),
+    top: view.getInt32(4, true),
+    right: view.getInt32(8, true),
+    bottom: view.getInt32(12, true)
+  };
+}
+function msosptToPresetShape(msospt) {
+  const mapping = {
+    0: "rect",
+    1: "rect",
+    2: "roundRect",
+    3: "ellipse",
+    4: "diamond",
+    5: "triangle",
+    6: "rtTriangle",
+    7: "parallelogram",
+    8: "trapezoid",
+    9: "hexagon",
+    10: "octagon",
+    11: "plus",
+    12: "star5",
+    13: "rightArrow",
+    14: "mathNotEqual",
+    15: "homePlate",
+    16: "cube",
+    20: "line",
+    21: "bentConnector3",
+    32: "straightConnector1",
+    33: "bentConnector2",
+    34: "bentConnector3",
+    35: "bentConnector4",
+    36: "bentConnector5",
+    37: "curvedConnector2",
+    38: "curvedConnector3",
+    39: "curvedConnector4",
+    40: "curvedConnector5",
+    61: "rect",
+    75: "rect",
+    109: "wedgeRoundRectCallout",
+    110: "wedgeEllipseCallout",
+    183: "sun",
+    184: "moon",
+    185: "bracketPair",
+    186: "bracePair",
+    187: "star4",
+    188: "doubleWave",
+    202: "rect"
+  };
+  return mapping[msospt] ?? "rect";
+}
+
+// packages/@oxen-office/ppt/src/extractor/text-extractor.ts
+function extractTextBodies(children, fonts, colorScheme) {
+  const bodies = [];
+  let i2 = 0;
+  while (i2 < children.length) {
+    const rec = children[i2];
+    if (rec.recType === RT.TextHeaderAtom) {
+      const { textBody, consumed } = extractOneTextBody(children, i2, fonts, colorScheme);
+      if (textBody) {
+        bodies.push(textBody);
+      }
+      i2 += consumed;
+    } else {
+      i2++;
+    }
+  }
+  return bodies;
+}
+function extractOneTextBody(children, startIndex, fonts, colorScheme) {
+  let idx = startIndex + 1;
+  let rawText;
+  let styleRecord;
+  while (idx < children.length) {
+    const rec = children[idx];
+    if (rec.recType === RT.TextCharsAtom) {
+      rawText = decodeTextCharsAtom(rec);
+      idx++;
+    } else if (rec.recType === RT.TextBytesAtom) {
+      rawText = decodeTextBytesAtom(rec);
+      idx++;
+    } else if (rec.recType === RT.StyleTextPropAtom) {
+      styleRecord = rec;
+      idx++;
+    } else if (rec.recType === RT.TextHeaderAtom) {
+      break;
+    } else {
+      idx++;
+      if (rec.recType === RT.TextHeaderAtom)
+        break;
+    }
+  }
+  if (rawText === undefined) {
+    return { textBody: undefined, consumed: idx - startIndex };
+  }
+  const textLength = rawText.length;
+  let paragraphRuns = [];
+  let characterRuns = [];
+  if (styleRecord) {
+    const styleData = parseStyleTextPropAtom(styleRecord, textLength);
+    paragraphRuns = styleData.paragraphRuns;
+    characterRuns = styleData.characterRuns;
+  }
+  const paragraphs = buildParagraphs(rawText, paragraphRuns, characterRuns, fonts, colorScheme);
+  return {
+    textBody: { paragraphs },
+    consumed: idx - startIndex
+  };
+}
+function buildParagraphs(rawText, paragraphRuns, characterRuns, fonts, colorScheme) {
+  const lines = rawText.split("\r");
+  const paragraphs = [];
+  let charPos = 0;
+  let paraRunIdx = 0;
+  let charRunIdx = 0;
+  let charRunOffset = 0;
+  for (let lineIdx = 0;lineIdx < lines.length; lineIdx++) {
+    const lineText = lines[lineIdx];
+    const lineLength = lineText.length + (lineIdx < lines.length - 1 ? 1 : 0);
+    const paraStyle = paragraphRuns[paraRunIdx];
+    const runs = [];
+    let linePos = 0;
+    while (linePos < lineText.length) {
+      const charStyle = characterRuns[charRunIdx];
+      const remainingInRun = charStyle ? charStyle.charCount - charRunOffset : lineText.length;
+      const charsToTake = Math.min(remainingInRun, lineText.length - linePos);
+      if (charsToTake > 0) {
+        const text = lineText.substring(linePos, linePos + charsToTake);
+        runs.push({
+          text,
+          properties: buildRunProperties(charStyle, fonts, colorScheme)
+        });
+      }
+      linePos += charsToTake;
+      charRunOffset += charsToTake;
+      if (charStyle && charRunOffset >= charStyle.charCount) {
+        charRunIdx++;
+        charRunOffset = 0;
+      }
+    }
+    if (runs.length === 0) {
+      runs.push({ text: "", properties: {} });
+    }
+    const level = deriveLevel(paraStyle);
+    const paragraph = {
+      runs,
+      ...paraStyle?.alignment !== undefined ? { alignment: alignmentToString(paraStyle.alignment) } : {},
+      ...level > 0 ? { level } : {},
+      ...paraStyle?.bulletFlags !== undefined ? { bullet: buildBullet(paraStyle) } : {},
+      ...paraStyle?.lineSpacing !== undefined ? { lineSpacing: paraStyle.lineSpacing } : {},
+      ...paraStyle?.spaceBefore !== undefined ? { spaceBefore: paraStyle.spaceBefore } : {},
+      ...paraStyle?.spaceAfter !== undefined ? { spaceAfter: paraStyle.spaceAfter } : {}
+    };
+    paragraphs.push(paragraph);
+    charPos += lineLength;
+    charRunOffset += lineIdx < lines.length - 1 ? 1 : 0;
+    if (characterRuns[charRunIdx] && charRunOffset >= characterRuns[charRunIdx].charCount) {
+      charRunIdx++;
+      charRunOffset = 0;
+    }
+    if (paraStyle) {
+      paraRunIdx++;
+    }
+  }
+  return paragraphs;
+}
+function buildRunProperties(charStyle, fonts, colorScheme) {
+  if (!charStyle)
+    return {};
+  return {
+    ...charStyle.bold ? { bold: true } : {},
+    ...charStyle.italic ? { italic: true } : {},
+    ...charStyle.underline ? { underline: true } : {},
+    ...charStyle.strikethrough ? { strikethrough: true } : {},
+    ...charStyle.fontSize !== undefined ? { fontSize: charStyle.fontSize } : {},
+    ...charStyle.fontRef !== undefined && fonts[charStyle.fontRef] ? { fontFamily: fonts[charStyle.fontRef] } : {},
+    ...charStyle.color !== undefined ? { color: resolveColor(charStyle.color, colorScheme) } : {}
+  };
+}
+function alignmentToString(alignment) {
+  switch (alignment) {
+    case 0:
+      return "left";
+    case 1:
+      return "center";
+    case 2:
+      return "right";
+    case 3:
+      return "justify";
+    default:
+      return;
+  }
+}
+function deriveLevel(paraStyle) {
+  if (!paraStyle)
+    return 0;
+  if (paraStyle.indent !== undefined && paraStyle.indent > 0)
+    return paraStyle.indent;
+  if (paraStyle.leftMargin !== undefined && paraStyle.leftMargin > 0) {
+    return Math.min(Math.round(paraStyle.leftMargin / 228600), 8);
+  }
+  return 0;
+}
+function buildBullet(paraStyle) {
+  if (!paraStyle.bulletFlags)
+    return;
+  const hasBullet = !!(paraStyle.bulletFlags & 15);
+  if (!hasBullet)
+    return { type: "none" };
+  if (paraStyle.bulletChar !== undefined) {
+    return { type: "char", char: String.fromCharCode(paraStyle.bulletChar) };
+  }
+  return { type: "autoNumber" };
+}
+
+// packages/@oxen-office/ppt/src/extractor/hyperlink-extractor.ts
+function extractHyperlinkMap(documentRecord) {
+  const map = new Map;
+  const docChildren = documentRecord.children ?? [];
+  const exObjList = findChildByType(docChildren, RT.ExObjListContainer);
+  if (!exObjList)
+    return map;
+  const hyperlinkContainers = findChildrenByType(exObjList.children ?? [], RT.ExternalHyperlinkContainer);
+  for (const container of hyperlinkContainers) {
+    const children = container.children ?? [];
+    const atom = findChildByType(children, RT.ExternalHyperlinkAtom);
+    if (!atom || atom.data.byteLength < 4)
+      continue;
+    const view = new DataView(atom.data.buffer, atom.data.byteOffset, atom.data.byteLength);
+    const exHyperlinkId = view.getUint32(0, true);
+    const cstrings = findChildrenByType(children, RT.CString);
+    for (const cs of cstrings) {
+      if (cs.recInstance === 0) {
+        const url = decodeUtf16Le2(cs.data);
+        if (url.length > 0) {
+          map.set(exHyperlinkId, url);
+        }
+        break;
+      }
+    }
+  }
+  return map;
+}
+function extractTextHyperlinkRanges(textboxChildren) {
+  const ranges = [];
+  let i2 = 0;
+  while (i2 < textboxChildren.length) {
+    const rec = textboxChildren[i2];
+    if (rec.recType === RT.InteractiveInfoAtom) {
+      const instance = rec.children ? findChildByType(rec.children, RT.InteractiveInfoInstance) : undefined;
+      let exHyperlinkIdRef;
+      if (instance && instance.data.byteLength >= 4) {
+        const view = new DataView(instance.data.buffer, instance.data.byteOffset, instance.data.byteLength);
+        exHyperlinkIdRef = view.getUint32(4, true);
+      } else if (!rec.children && rec.data.byteLength >= 8) {
+        const view = new DataView(rec.data.buffer, rec.data.byteOffset, rec.data.byteLength);
+        exHyperlinkIdRef = view.getUint32(4, true);
+      }
+      if (exHyperlinkIdRef !== undefined && exHyperlinkIdRef !== 0) {
+        const nextIdx = i2 + 1;
+        if (nextIdx < textboxChildren.length && textboxChildren[nextIdx].recType === RT.TxInteractiveInfoAtom) {
+          const txRec = textboxChildren[nextIdx];
+          if (txRec.data.byteLength >= 8) {
+            const txView = new DataView(txRec.data.buffer, txRec.data.byteOffset, txRec.data.byteLength);
+            const begin = txView.getUint32(0, true);
+            const end = txView.getUint32(4, true);
+            ranges.push({ begin, end, exHyperlinkIdRef });
+          }
+          i2 = nextIdx + 1;
+          continue;
+        }
+      }
+    }
+    i2++;
+  }
+  return ranges.sort((a, b) => a.begin - b.begin);
+}
+function decodeUtf16Le2(data) {
+  const chars = [];
+  for (let i2 = 0;i2 + 1 < data.length; i2 += 2) {
+    const code = data[i2] | data[i2 + 1] << 8;
+    if (code === 0)
+      break;
+    chars.push(String.fromCharCode(code));
+  }
+  return chars.join("");
+}
+
+// packages/@oxen-office/ppt/src/extractor/table-extractor.ts
+var MASTER_UNIT_TO_EMU2 = 914400 / 576;
+var TABLE_FLAG = 927;
+var TABLE_LAYOUT = 928;
+function isTableGroup(groupContainer) {
+  const children = groupContainer.children ?? [];
+  const spContainers = findChildrenByType(children, RT.OfficeArtSpContainer);
+  if (spContainers.length === 0)
+    return;
+  const patriarch = spContainers[0];
+  const tertiaryFOPT = findChildByType(patriarch.children ?? [], RT.OfficeArtTertiaryFOPT);
+  if (!tertiaryFOPT)
+    return;
+  const props = parseOfficeArtFOPT(tertiaryFOPT);
+  const tableFlag = props.get(TABLE_FLAG);
+  if (!tableFlag || tableFlag.value !== 1)
+    return;
+  return props;
+}
+function extractTable(groupContainer, tertiaryProps, fonts, colorScheme) {
+  const layoutProp = tertiaryProps.get(TABLE_LAYOUT);
+  if (!layoutProp?.complexData || layoutProp.complexData.byteLength < 6)
+    return;
+  const layoutView = new DataView(layoutProp.complexData.buffer, layoutProp.complexData.byteOffset, layoutProp.complexData.byteLength);
+  const nRows = layoutView.getUint16(0, true);
+  const nCols = layoutView.getUint16(2, true);
+  const rowHeightsMaster = [];
+  for (let i2 = 0;i2 < nRows && 6 + (i2 + 1) * 4 <= layoutProp.complexData.byteLength; i2++) {
+    rowHeightsMaster.push(layoutView.getInt32(6 + i2 * 4, true));
+  }
+  const children = groupContainer.children ?? [];
+  const cells = [];
+  for (const child of children) {
+    if (child.recType !== RT.OfficeArtSpContainer)
+      continue;
+    const childChildren = child.children ?? [];
+    const fsp = findChildByType(childChildren, RT.OfficeArtFSP);
+    if (!fsp)
+      continue;
+    const flags = parseOfficeArtFSP(fsp);
+    if (flags.isPatriarch)
+      continue;
+    if (fsp.recInstance === 20)
+      continue;
+    const anchor = findChildByType(childChildren, RT.OfficeArtChildAnchor);
+    if (!anchor)
+      continue;
+    const a = parseChildAnchor(anchor);
+    let textBody;
+    const clientTextbox = findChildByType(childChildren, RT.OfficeArtClientTextbox);
+    if (clientTextbox?.children) {
+      const bodies = extractTextBodies(clientTextbox.children, fonts, colorScheme);
+      if (bodies.length > 0)
+        textBody = bodies[0];
+    }
+    cells.push({ left: a.left, top: a.top, right: a.right, bottom: a.bottom, textBody });
+  }
+  if (cells.length === 0)
+    return;
+  const colBounds = deriveGridLines(cells.map((c) => c.left), cells.map((c) => c.right));
+  const rowBounds = deriveGridLines(cells.map((c) => c.top), cells.map((c) => c.bottom));
+  if (colBounds.length < 2 || rowBounds.length < 2)
+    return;
+  const actualNCols = colBounds.length - 1;
+  const actualNRows = rowBounds.length - 1;
+  const columnWidthsEmu = [];
+  for (let c = 0;c < actualNCols; c++) {
+    columnWidthsEmu.push(Math.round((colBounds[c + 1] - colBounds[c]) * MASTER_UNIT_TO_EMU2));
+  }
+  const grid = Array.from({ length: actualNRows }, () => Array.from({ length: actualNCols }, () => {
+    return;
+  }));
+  for (const cell of cells) {
+    const col = findGridIndex(colBounds, cell.left);
+    const row = findGridIndex(rowBounds, cell.top);
+    const colEnd = findGridIndex(colBounds, cell.right);
+    const rowEnd = findGridIndex(rowBounds, cell.bottom);
+    if (col < 0 || row < 0 || colEnd < 0 || rowEnd < 0)
+      continue;
+    const colSpan = colEnd - col;
+    const rowSpan = rowEnd - row;
+    grid[row][col] = {
+      text: cell.textBody,
+      ...colSpan > 1 ? { colSpan } : {},
+      ...rowSpan > 1 ? { rowSpan } : {}
+    };
+  }
+  const rows = [];
+  for (let r = 0;r < actualNRows; r++) {
+    const heightEmu = Math.round((rowBounds[r + 1] - rowBounds[r]) * MASTER_UNIT_TO_EMU2);
+    const rowCells = [];
+    for (let c = 0;c < actualNCols; c++) {
+      rowCells.push(grid[r][c] ?? { text: undefined });
+    }
+    rows.push({ heightEmu, cells: rowCells });
+  }
+  return { columnWidthsEmu, rows };
+}
+function deriveGridLines(starts, ends) {
+  const positions = new Set;
+  for (const s of starts)
+    positions.add(s);
+  for (const e of ends)
+    positions.add(e);
+  return Array.from(positions).sort((a, b) => a - b);
+}
+function findGridIndex(gridLines, position) {
+  let minDist = Infinity;
+  let bestIdx = -1;
+  for (let i2 = 0;i2 < gridLines.length; i2++) {
+    const dist = Math.abs(gridLines[i2] - position);
+    if (dist < minDist) {
+      minDist = dist;
+      bestIdx = i2;
+    }
+  }
+  return bestIdx;
+}
+
+// packages/@oxen-office/ppt/src/extractor/shape-extractor.ts
+var MASTER_UNIT_TO_EMU3 = 914400 / 576;
+function extractShapes(slideRecord, fonts, colorScheme, hyperlinkMap) {
+  const children = slideRecord.children ?? [];
+  let dgContainer = findChildByType(children, RT.OfficeArtDgContainer);
+  if (!dgContainer) {
+    const ppDrawing = findChildByType(children, RT.PPDrawing);
+    if (ppDrawing) {
+      dgContainer = findChildByType(ppDrawing.children ?? [], RT.OfficeArtDgContainer);
+    }
+  }
+  if (!dgContainer)
+    return [];
+  const spgrContainer = findChildByType(dgContainer.children ?? [], RT.OfficeArtSpgrContainer);
+  if (!spgrContainer)
+    return [];
+  return extractShapesFromGroup(spgrContainer, fonts, colorScheme, hyperlinkMap);
+}
+function extractShapesFromGroup(container, fonts, colorScheme, hyperlinkMap) {
+  const shapes = [];
+  const children = container.children ?? [];
+  for (const child of children) {
+    if (child.recType === RT.OfficeArtSpContainer) {
+      const shape = extractSingleShape(child, fonts, colorScheme, hyperlinkMap);
+      if (shape)
+        shapes.push(shape);
+    } else if (child.recType === RT.OfficeArtSpgrContainer) {
+      const tertiaryProps = isTableGroup(child);
+      if (tertiaryProps) {
+        const table = extractTable(child, tertiaryProps, fonts, colorScheme);
+        if (table) {
+          const transform = extractGroupTransform(child);
+          shapes.push({
+            type: "table",
+            transform: transform ?? defaultTransform(),
+            table
+          });
+          continue;
+        }
+      }
+      const groupShapes = extractShapesFromGroup(child, fonts, colorScheme, hyperlinkMap);
+      if (groupShapes.length > 0) {
+        const transform = extractGroupTransform(child);
+        shapes.push({
+          type: "group",
+          transform: transform ?? defaultTransform(),
+          children: groupShapes
+        });
+      }
+    }
+  }
+  return shapes;
+}
+function extractSingleShape(spContainer, fonts, colorScheme, hyperlinkMap) {
+  const children = spContainer.children ?? [];
+  const fspRecord = findChildByType(children, RT.OfficeArtFSP);
+  if (!fspRecord)
+    return;
+  const fsp = parseOfficeArtFSP(fspRecord);
+  if (fsp.isDeleted || fsp.isPatriarch)
+    return;
+  const foptRecord = findChildByType(children, RT.OfficeArtFOPT);
+  const props = foptRecord ? parseOfficeArtFOPT(foptRecord) : new Map;
+  const anchorRecord = findChildByType(children, RT.OfficeArtClientAnchor);
+  const childAnchorRecord = findChildByType(children, RT.OfficeArtChildAnchor);
+  let transform;
+  if (anchorRecord) {
+    const anchor = parseClientAnchor(anchorRecord);
+    transform = anchorToTransform(anchor.left, anchor.top, anchor.right, anchor.bottom, fsp, props);
+  } else if (childAnchorRecord) {
+    const anchor = parseChildAnchor(childAnchorRecord);
+    transform = childAnchorToTransform(anchor.left, anchor.top, anchor.right, anchor.bottom, fsp, props);
+  } else {
+    transform = defaultTransform();
+  }
+  const msospt = fspRecord.recInstance;
+  const presetShape = msosptToPresetShape(msospt);
+  const fill = extractFill(props, colorScheme);
+  const line = extractLine(props, colorScheme);
+  const clientTextboxRecord = findChildByType(children, RT.OfficeArtClientTextbox);
+  let textBody;
+  if (clientTextboxRecord?.children) {
+    const bodies = extractTextBodies(clientTextboxRecord.children, fonts, colorScheme);
+    if (bodies.length > 0) {
+      textBody = bodies[0];
+      if (hyperlinkMap && hyperlinkMap.size > 0) {
+        const ranges = extractTextHyperlinkRanges(clientTextboxRecord.children);
+        if (ranges.length > 0) {
+          textBody = applyHyperlinksToTextBody(textBody, ranges, hyperlinkMap);
+        }
+      }
+    }
+  }
+  let picture;
+  const blipId = getShapeProp(props, SHAPE_PROP.BLIP_ID);
+  if (blipId !== undefined) {
+    picture = {
+      pictureIndex: blipId - 1,
+      ...extractCrop(props)
+    };
+  }
+  let type = "shape";
+  if (picture)
+    type = "picture";
+  else if (fsp.isConnector || msospt === 20 || msospt >= 32 && msospt <= 40)
+    type = "connector";
+  return {
+    type,
+    transform,
+    presetShape,
+    ...fill ? { fill } : {},
+    ...line ? { line } : {},
+    ...textBody ? { textBody } : {},
+    ...picture ? { picture } : {}
+  };
+}
+function anchorToTransform(left, top, right, bottom, fsp, props) {
+  const scale = MASTER_UNIT_TO_EMU3;
+  const xEmu = Math.round(left * scale);
+  const yEmu = Math.round(top * scale);
+  const widthEmu = Math.round((right - left) * scale);
+  const heightEmu = Math.round((bottom - top) * scale);
+  const rotation = extractRotation(props);
+  return {
+    xEmu,
+    yEmu,
+    widthEmu: Math.abs(widthEmu),
+    heightEmu: Math.abs(heightEmu),
+    rotation,
+    flipH: fsp.flipH,
+    flipV: fsp.flipV
+  };
+}
+function childAnchorToTransform(left, top, right, bottom, fsp, props) {
+  const rotation = extractRotation(props);
+  return {
+    xEmu: left,
+    yEmu: top,
+    widthEmu: Math.abs(right - left),
+    heightEmu: Math.abs(bottom - top),
+    rotation,
+    flipH: fsp.flipH,
+    flipV: fsp.flipV
+  };
+}
+function extractRotation(props) {
+  const raw = getShapeProp(props, SHAPE_PROP.ROTATION);
+  if (raw === undefined)
+    return 0;
+  return (raw >> 16) + (raw & 65535) / 65536;
+}
+function extractFill(props, colorScheme) {
+  const boolProps = getShapeProp(props, SHAPE_PROP.FILL_STYLE_BOOL_PROPS);
+  if (boolProps !== undefined) {
+    const hasFill = boolProps & 16;
+    const useFill = boolProps & 1048576;
+    if (useFill && !hasFill) {
+      return { type: "none" };
+    }
+  }
+  const fillColor = getShapeProp(props, SHAPE_PROP.FILL_COLOR);
+  if (fillColor !== undefined) {
+    return { type: "solid", color: resolveColor(fillColor, colorScheme) };
+  }
+  return;
+}
+function extractLine(props, colorScheme) {
+  const boolProps = getShapeProp(props, SHAPE_PROP.LINE_STYLE_BOOL_PROPS);
+  if (boolProps !== undefined) {
+    const hasLine = boolProps & 8;
+    const useLine = boolProps & 524288;
+    if (useLine && !hasLine) {
+      return;
+    }
+  }
+  const lineColor = getShapeProp(props, SHAPE_PROP.LINE_COLOR);
+  const lineWidth = getShapeProp(props, SHAPE_PROP.LINE_WIDTH);
+  const lineDash = getShapeProp(props, SHAPE_PROP.LINE_DASH_STYLE);
+  if (lineColor === undefined && lineWidth === undefined)
+    return;
+  return {
+    widthEmu: lineWidth ?? 9525,
+    ...lineColor !== undefined ? { color: resolveColor(lineColor, colorScheme) } : {},
+    ...lineDash !== undefined ? { dashStyle: dashStyleToString(lineDash) } : {}
+  };
+}
+function dashStyleToString(value) {
+  switch (value) {
+    case 0:
+      return "solid";
+    case 1:
+      return "dash";
+    case 2:
+      return "dot";
+    case 3:
+      return "dashDot";
+    case 4:
+      return "dashDotDot";
+    default:
+      return "solid";
+  }
+}
+function extractCrop(props) {
+  const cropLeft = getShapeProp(props, SHAPE_PROP.CROP_FROM_LEFT);
+  const cropTop = getShapeProp(props, SHAPE_PROP.CROP_FROM_TOP);
+  const cropRight = getShapeProp(props, SHAPE_PROP.CROP_FROM_RIGHT);
+  const cropBottom = getShapeProp(props, SHAPE_PROP.CROP_FROM_BOTTOM);
+  return {
+    ...cropLeft ? { cropLeft: fixedPointToFraction(cropLeft) } : {},
+    ...cropTop ? { cropTop: fixedPointToFraction(cropTop) } : {},
+    ...cropRight ? { cropRight: fixedPointToFraction(cropRight) } : {},
+    ...cropBottom ? { cropBottom: fixedPointToFraction(cropBottom) } : {}
+  };
+}
+function fixedPointToFraction(value) {
+  return value / 65536;
+}
+function extractGroupTransform(groupContainer) {
+  const children = groupContainer.children ?? [];
+  const spContainers = findChildrenByType(children, RT.OfficeArtSpContainer);
+  if (spContainers.length === 0)
+    return;
+  const patriarch = spContainers[0];
+  const anchor = findChildByType(patriarch.children ?? [], RT.OfficeArtClientAnchor);
+  if (!anchor)
+    return;
+  const a = parseClientAnchor(anchor);
+  const scale = MASTER_UNIT_TO_EMU3;
+  return {
+    xEmu: Math.round(a.left * scale),
+    yEmu: Math.round(a.top * scale),
+    widthEmu: Math.round((a.right - a.left) * scale),
+    heightEmu: Math.round((a.bottom - a.top) * scale),
+    rotation: 0,
+    flipH: false,
+    flipV: false
+  };
+}
+function defaultTransform() {
+  return { xEmu: 0, yEmu: 0, widthEmu: 0, heightEmu: 0, rotation: 0, flipH: false, flipV: false };
+}
+function applyHyperlinksToTextBody(textBody, ranges, hyperlinkMap) {
+  const newParagraphs = [];
+  let charPos = 0;
+  for (const para of textBody.paragraphs) {
+    const newRuns = [];
+    for (const run of para.runs) {
+      const runStart = charPos;
+      const runEnd = charPos + run.text.length;
+      const overlapping = ranges.filter((r) => r.begin < runEnd && r.end > runStart);
+      if (overlapping.length === 0) {
+        newRuns.push(run);
+      } else {
+        let pos = 0;
+        for (const range2 of overlapping) {
+          const relStart = Math.max(0, range2.begin - runStart);
+          const relEnd = Math.min(run.text.length, range2.end - runStart);
+          if (relStart > pos) {
+            newRuns.push({ text: run.text.substring(pos, relStart), properties: run.properties });
+          }
+          const url = hyperlinkMap.get(range2.exHyperlinkIdRef);
+          if (url) {
+            newRuns.push({
+              text: run.text.substring(relStart, relEnd),
+              properties: { ...run.properties, hyperlink: url }
+            });
+          } else {
+            newRuns.push({ text: run.text.substring(relStart, relEnd), properties: run.properties });
+          }
+          pos = relEnd;
+        }
+        if (pos < run.text.length) {
+          newRuns.push({ text: run.text.substring(pos), properties: run.properties });
+        }
+      }
+      charPos += run.text.length;
+    }
+    newParagraphs.push({ ...para, runs: newRuns });
+    charPos += 1;
+  }
+  return { ...textBody, paragraphs: newParagraphs };
+}
+
+// packages/@oxen-office/ppt/src/extractor/index.ts
+function extractPptPresentation(parsed, images, ctx) {
+  const docChildren = parsed.documentRecord.children ?? [];
+  const documentAtomRecord = findChildByType(docChildren, RT.DocumentAtom);
+  let slideSize;
+  if (documentAtomRecord) {
+    const docAtom = parseDocumentAtom(documentAtomRecord);
+    slideSize = {
+      widthEmu: docAtom.slideSizeXEmu,
+      heightEmu: docAtom.slideSizeYEmu
+    };
+  } else {
+    slideSize = { widthEmu: 12192000, heightEmu: 6858000 };
+  }
+  const fonts = extractFonts(docChildren);
+  const masterColorScheme = parsed.masterRecords.length > 0 ? extractColorScheme(parsed.masterRecords[0]) : DEFAULT_COLOR_SCHEME;
+  const hyperlinkMap = extractHyperlinkMap(parsed.documentRecord);
+  const slides = [];
+  for (let i2 = 0;i2 < parsed.slideRecords.length; i2++) {
+    const slideRecord = parsed.slideRecords[i2];
+    try {
+      const slide = extractSlide(slideRecord, fonts, masterColorScheme, hyperlinkMap, parsed.noteRecords[i2]);
+      slides.push(slide);
+    } catch (err2) {
+      warnOrThrow(ctx, { code: "PPT_SLIDE_PARSE_FAILED", where: "extractPptPresentation", message: `Failed to extract slide ${i2}: ${err2 instanceof Error ? err2.message : String(err2)}` }, err2 instanceof Error ? err2 : new Error(String(err2)));
+      slides.push({ shapes: [] });
+    }
+  }
+  return { slideSize, slides, images };
+}
+function extractSlide(slideRecord, fonts, masterColorScheme, hyperlinkMap, notesRecord) {
+  const colorScheme = extractColorScheme(slideRecord) ?? masterColorScheme;
+  const shapes = extractShapes(slideRecord, fonts, colorScheme, hyperlinkMap);
+  let notes;
+  if (notesRecord) {
+    notes = extractNotesText(notesRecord, fonts, colorScheme);
+  }
+  return {
+    shapes,
+    ...notes ? { notes } : {}
+  };
+}
+function extractFonts(docChildren) {
+  const fonts = [];
+  const envContainer = findChildByType(docChildren, RT.Environment);
+  if (!envContainer)
+    return fonts;
+  const fontCollection = findChildByType(envContainer.children ?? [], RT.FontCollection);
+  if (!fontCollection)
+    return fonts;
+  const fontEntities = findChildrenByType(fontCollection.children ?? [], RT.FontEntityAtom);
+  for (const fe of fontEntities) {
+    const fontData = parseFontEntityAtom(fe);
+    fonts.push(fontData.name);
+  }
+  return fonts;
+}
+function extractNotesText(notesRecord, fonts, colorScheme) {
+  const shapes = extractShapes(notesRecord, fonts, colorScheme);
+  const textParts = [];
+  for (const shape of shapes) {
+    if (!shape.textBody)
+      continue;
+    for (const para of shape.textBody.paragraphs) {
+      const text2 = para.runs.map((r) => r.text).join("");
+      if (text2.length > 0)
+        textParts.push(text2);
+    }
+  }
+  const text = textParts.join(`
+`);
+  return text.length > 0 ? text : undefined;
+}
+
+// packages/@oxen-office/ppt/src/converter/template.ts
+var APP_XML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
+  <AppVersion>16.0</AppVersion>
+</Properties>`;
+var ROOT_RELS_XML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
+</Relationships>`;
+var MINIMAL_THEME = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="PPT Import Theme">
+  <a:themeElements>
+    <a:clrScheme name="PPT Import">
+      <a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>
+      <a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>
+      <a:dk2><a:srgbClr val="44546A"/></a:dk2>
+      <a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>
+      <a:accent1><a:srgbClr val="5B9BD5"/></a:accent1>
+      <a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
+      <a:accent3><a:srgbClr val="A5A5A5"/></a:accent3>
+      <a:accent4><a:srgbClr val="FFC000"/></a:accent4>
+      <a:accent5><a:srgbClr val="4472C4"/></a:accent5>
+      <a:accent6><a:srgbClr val="70AD47"/></a:accent6>
+      <a:hlink><a:srgbClr val="0563C1"/></a:hlink>
+      <a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+    </a:clrScheme>
+    <a:fontScheme name="PPT Import">
+      <a:majorFont><a:latin typeface="Calibri"/></a:majorFont>
+      <a:minorFont><a:latin typeface="Calibri"/></a:minorFont>
+    </a:fontScheme>
+    <a:fmtScheme name="PPT Import">
+      <a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst>
+      <a:lnStyleLst><a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst>
+      <a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>
+      <a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst>
+    </a:fmtScheme>
+  </a:themeElements>
+</a:theme>`;
+var MINIMAL_SLIDE_MASTER = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sldMaster
+  xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr/>
+    </p:spTree>
+  </p:cSld>
+  <p:txStyles>
+    <p:titleStyle/>
+    <p:bodyStyle/>
+  </p:txStyles>
+</p:sldMaster>`;
+var MINIMAL_SLIDE_LAYOUT = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sldLayout
+  xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+  type="blank">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr/>
+    </p:spTree>
+  </p:cSld>
+</p:sldLayout>`;
+
+// packages/@oxen-office/ppt/src/converter/presentation-xml.ts
+var SLIDE_ID_START = 256;
+var SLIDE_MASTER_ID = 2147483648;
+var CT_PRESENTATION = "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml";
+var CT_SLIDE = "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
+var CT_SLIDE_LAYOUT = "application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml";
+var CT_SLIDE_MASTER = "application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml";
+var CT_THEME = "application/vnd.openxmlformats-officedocument.theme+xml";
+var CT_NOTES = "application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml";
+var CT_CHART = "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
+var RT_SLIDE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide";
+var RT_SLIDE_LAYOUT = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout";
+var RT_SLIDE_MASTER = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster";
+var RT_THEME = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme";
+var RT_IMAGE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
+var RT_HYPERLINK = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
+var RT_NOTES = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide";
+function buildContentTypesXml(slideCount, options) {
+  const overrides = [];
+  overrides.push(`<Override PartName="/ppt/presentation.xml" ContentType="${CT_PRESENTATION}"/>`);
+  overrides.push(`<Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="${CT_SLIDE_LAYOUT}"/>`);
+  overrides.push(`<Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="${CT_SLIDE_MASTER}"/>`);
+  overrides.push(`<Override PartName="/ppt/theme/theme1.xml" ContentType="${CT_THEME}"/>`);
+  for (let i2 = 1;i2 <= slideCount; i2++) {
+    overrides.push(`<Override PartName="/ppt/slides/slide${i2}.xml" ContentType="${CT_SLIDE}"/>`);
+  }
+  if (options?.hasNotes) {
+    for (let i2 = 0;i2 < options.hasNotes.length; i2++) {
+      if (options.hasNotes[i2]) {
+        overrides.push(`<Override PartName="/ppt/notesSlides/notesSlide${i2 + 1}.xml" ContentType="${CT_NOTES}"/>`);
+      }
+    }
+  }
+  if (options?.hasCharts) {
+    for (const chartIdx of options.hasCharts) {
+      overrides.push(`<Override PartName="/ppt/charts/chart${chartIdx}.xml" ContentType="${CT_CHART}"/>`);
+    }
+  }
+  const defaultExtensions = [
+    `<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>`,
+    `<Default Extension="xml" ContentType="application/xml"/>`
+  ];
+  const imageExts = new Set(options?.imageExtensions ?? []);
+  if (imageExts.has("png"))
+    defaultExtensions.push(`<Default Extension="png" ContentType="image/png"/>`);
+  if (imageExts.has("jpeg") || imageExts.has("jpg"))
+    defaultExtensions.push(`<Default Extension="jpeg" ContentType="image/jpeg"/>`);
+  if (imageExts.has("emf"))
+    defaultExtensions.push(`<Default Extension="emf" ContentType="image/x-emf"/>`);
+  if (imageExts.has("wmf"))
+    defaultExtensions.push(`<Default Extension="wmf" ContentType="image/x-wmf"/>`);
+  if (imageExts.has("bmp"))
+    defaultExtensions.push(`<Default Extension="bmp" ContentType="image/bmp"/>`);
+  if (imageExts.has("tiff"))
+    defaultExtensions.push(`<Default Extension="tiff" ContentType="image/tiff"/>`);
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` + `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` + defaultExtensions.join("") + overrides.join("") + `</Types>`;
+}
+function buildPresentationXml(slideCount, slideSize) {
+  const sldIds = [];
+  for (let i2 = 1;i2 <= slideCount; i2++) {
+    const id = SLIDE_ID_START - 1 + i2;
+    const rId = `rId${i2 + 1}`;
+    sldIds.push(`<p:sldId id="${id}" r:id="${rId}"/>`);
+  }
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` + `<p:presentation ` + `xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" ` + `xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" ` + `xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">` + `<p:sldMasterIdLst><p:sldMasterId id="${SLIDE_MASTER_ID}" r:id="rId1"/></p:sldMasterIdLst>` + `<p:sldIdLst>${sldIds.join("")}</p:sldIdLst>` + `<p:sldSz cx="${slideSize.widthEmu}" cy="${slideSize.heightEmu}"/>` + `<p:defaultTextStyle><a:defPPr><a:defRPr sz="1800"/></a:defPPr></p:defaultTextStyle>` + `</p:presentation>`;
+}
+function buildPresentationRelsXml(slideCount) {
+  const rels = [];
+  rels.push(`<Relationship Id="rId1" Type="${RT_SLIDE_MASTER}" Target="slideMasters/slideMaster1.xml"/>`);
+  for (let i2 = 1;i2 <= slideCount; i2++) {
+    rels.push(`<Relationship Id="rId${i2 + 1}" Type="${RT_SLIDE}" Target="slides/slide${i2}.xml"/>`);
+  }
+  return wrapRelationships(rels);
+}
+function buildSlideRelsXml(extraRels) {
+  const rels = [];
+  rels.push(`<Relationship Id="rId1" Type="${RT_SLIDE_LAYOUT}" Target="../slideLayouts/slideLayout1.xml"/>`);
+  if (extraRels) {
+    for (const rel of extraRels) {
+      const targetMode = rel.targetMode ? ` TargetMode="${rel.targetMode}"` : "";
+      rels.push(`<Relationship Id="${rel.id}" Type="${rel.type}" Target="${rel.target}"${targetMode}/>`);
+    }
+  }
+  return wrapRelationships(rels);
+}
+function buildLayoutRelsXml() {
+  return wrapRelationships([
+    `<Relationship Id="rId1" Type="${RT_SLIDE_MASTER}" Target="../slideMasters/slideMaster1.xml"/>`
+  ]);
+}
+function buildMasterRelsXml() {
+  return wrapRelationships([
+    `<Relationship Id="rId1" Type="${RT_THEME}" Target="../theme/theme1.xml"/>`
+  ]);
+}
+function buildNotesSlideXml(text) {
+  const escapedText = escapeXml3(text);
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` + `<p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" ` + `xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" ` + `xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">` + `<p:cSld><p:spTree>` + `<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>` + `<p:grpSpPr/>` + `<p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes Placeholder"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr>` + `<p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>` + `<p:spPr/>` + `<p:txBody><a:bodyPr/><a:lstStyle/>` + `<a:p><a:r><a:rPr lang="en-US" dirty="0"/><a:t>${escapedText}</a:t></a:r></a:p>` + `</p:txBody></p:sp>` + `</p:spTree></p:cSld></p:notes>`;
+}
+function buildNotesRelsXml(slideIndex) {
+  return wrapRelationships([
+    `<Relationship Id="rId1" Type="${RT_SLIDE}" Target="../slides/slide${slideIndex}.xml"/>`
+  ]);
+}
+function wrapRelationships(rels) {
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` + `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` + rels.join("") + `</Relationships>`;
+}
+function escapeXml3(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+
+// packages/@oxen-office/ppt/src/converter/text-xml.ts
+function buildTextBodyXml(textBody, hyperlinks) {
+  const bodyProps = buildBodyProperties(textBody);
+  const paragraphs = textBody.paragraphs.map((p) => buildParagraphXml(p, hyperlinks)).join("");
+  return `<p:txBody>${bodyProps}<a:lstStyle/>${paragraphs}</p:txBody>`;
+}
+function buildBodyProperties(textBody) {
+  const attrs = [];
+  if (textBody.anchor) {
+    const anchorMap = { top: "t", middle: "ctr", bottom: "b" };
+    attrs.push(`anchor="${anchorMap[textBody.anchor] ?? "t"}"`);
+  }
+  if (textBody.wordWrap === false) {
+    attrs.push(`wrap="none"`);
+  }
+  if (textBody.rotation) {
+    attrs.push(`rot="${Math.round(textBody.rotation * 60000)}"`);
+  }
+  return `<a:bodyPr${attrs.length > 0 ? " " + attrs.join(" ") : ""}/>`;
+}
+function buildParagraphXml(paragraph, hyperlinks) {
+  const pPr = buildParagraphProperties(paragraph);
+  const runs = paragraph.runs.map((r) => buildRunXml(r, hyperlinks)).join("");
+  const endParaRPr = `<a:endParaRPr lang="en-US"/>`;
+  return `<a:p>${pPr}${runs}${endParaRPr}</a:p>`;
+}
+function buildParagraphProperties(paragraph) {
+  const attrs = [];
+  if (paragraph.alignment) {
+    const alignMap = { left: "l", center: "ctr", right: "r", justify: "just" };
+    attrs.push(`algn="${alignMap[paragraph.alignment] ?? "l"}"`);
+  }
+  if (paragraph.level !== undefined && paragraph.level > 0) {
+    attrs.push(`lvl="${paragraph.level}"`);
+  }
+  const children = [];
+  if (paragraph.bullet) {
+    if (paragraph.bullet.type === "none") {
+      children.push(`<a:buNone/>`);
+    } else if (paragraph.bullet.type === "char" && paragraph.bullet.char) {
+      children.push(`<a:buChar char="${escapeXml3(paragraph.bullet.char)}"/>`);
+    } else if (paragraph.bullet.type === "autoNumber") {
+      children.push(`<a:buAutoNum type="arabicPeriod"/>`);
+    }
+  }
+  if (paragraph.lineSpacing !== undefined) {
+    if (paragraph.lineSpacing > 0) {
+      children.push(`<a:lnSpc><a:spcPct val="${paragraph.lineSpacing * 1000}"/></a:lnSpc>`);
+    }
+  }
+  if (paragraph.spaceBefore !== undefined) {
+    children.push(`<a:spcBef><a:spcPts val="${Math.abs(paragraph.spaceBefore) * 100}"/></a:spcBef>`);
+  }
+  if (paragraph.spaceAfter !== undefined) {
+    children.push(`<a:spcAft><a:spcPts val="${Math.abs(paragraph.spaceAfter) * 100}"/></a:spcAft>`);
+  }
+  if (attrs.length === 0 && children.length === 0) {
+    return `<a:pPr/>`;
+  }
+  return `<a:pPr${attrs.length > 0 ? " " + attrs.join(" ") : ""}>${children.join("")}</a:pPr>`;
+}
+function buildRunXml(run, hyperlinks) {
+  const rPr = buildRunProperties2(run);
+  const text = escapeXml3(run.text);
+  if (run.properties.hyperlink && hyperlinks) {
+    const rId = hyperlinks.get(run.properties.hyperlink);
+    if (rId) {
+      return `<a:r>${rPr}<a:t>${text}</a:t></a:r>`;
+    }
+  }
+  return `<a:r>${rPr}<a:t>${text}</a:t></a:r>`;
+}
+function buildRunProperties2(run) {
+  const attrs = [];
+  const children = [];
+  const p = run.properties;
+  attrs.push(`lang="en-US"`);
+  if (p.bold)
+    attrs.push(`b="1"`);
+  if (p.italic)
+    attrs.push(`i="1"`);
+  if (p.underline)
+    attrs.push(`u="sng"`);
+  if (p.strikethrough)
+    attrs.push(`strike="sngStrike"`);
+  if (p.fontSize !== undefined) {
+    attrs.push(`sz="${Math.round(p.fontSize * 100)}"`);
+  }
+  if (p.color) {
+    children.push(`<a:solidFill><a:srgbClr val="${p.color}"/></a:solidFill>`);
+  }
+  if (p.fontFamily) {
+    children.push(`<a:latin typeface="${escapeXml3(p.fontFamily)}"/>`);
+    children.push(`<a:ea typeface="${escapeXml3(p.fontFamily)}"/>`);
+  }
+  if (p.hyperlink) {
+    children.push(`<a:hlinkClick r:id=""/>`);
+  }
+  return `<a:rPr ${attrs.join(" ")}>${children.join("")}</a:rPr>`;
+}
+
+// packages/@oxen-office/ppt/src/converter/shape-xml.ts
+var _shapeIdCounter = 2;
+function resetShapeIdCounter() {
+  _shapeIdCounter = 2;
+}
+function nextShapeId() {
+  return _shapeIdCounter++;
+}
+function buildShapeXml(shape, imageRefs, hyperlinks) {
+  switch (shape.type) {
+    case "picture":
+      return buildPictureXml(shape, imageRefs);
+    case "group":
+      return buildGroupXml(shape, imageRefs, hyperlinks);
+    case "connector":
+      return buildConnectorXml(shape);
+    case "table":
+      return buildTableXml(shape);
+    default:
+      return buildSpShapeXml(shape, hyperlinks);
+  }
+}
+function buildSpShapeXml(shape, hyperlinks) {
+  const id = nextShapeId();
+  const name = shape.name ?? `Shape ${id}`;
+  const nvSpPr = `<p:nvSpPr>` + `<p:cNvPr id="${id}" name="${escapeXml3(name)}"/>` + `<p:cNvSpPr/>` + `<p:nvPr/>` + `</p:nvSpPr>`;
+  const spPr = buildShapeProperties(shape);
+  const txBody = shape.textBody ? buildTextBodyXml(shape.textBody, hyperlinks) : "";
+  return `<p:sp>${nvSpPr}${spPr}${txBody}</p:sp>`;
+}
+function buildPictureXml(shape, imageRefs) {
+  const id = nextShapeId();
+  const name = shape.name ?? `Picture ${id}`;
+  const rId = shape.picture && imageRefs ? imageRefs.get(shape.picture.pictureIndex) : undefined;
+  if (!rId) {
+    return buildSpShapeXml({ ...shape, type: "shape" });
+  }
+  const nvPicPr = `<p:nvPicPr>` + `<p:cNvPr id="${id}" name="${escapeXml3(name)}"/>` + `<p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr>` + `<p:nvPr/>` + `</p:nvPicPr>`;
+  let blipFill = `<p:blipFill><a:blip r:embed="${rId}"/>`;
+  if (shape.picture && hasCrop(shape.picture)) {
+    const p = shape.picture;
+    blipFill += `<a:srcRect l="${pct2(p.cropLeft)}" t="${pct2(p.cropTop)}" r="${pct2(p.cropRight)}" b="${pct2(p.cropBottom)}"/>`;
+  }
+  blipFill += `<a:stretch><a:fillRect/></a:stretch></p:blipFill>`;
+  const spPr = buildTransformXml(shape.transform) + `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>`;
+  return `<p:pic>${nvPicPr}${blipFill}<p:spPr>${spPr}</p:spPr></p:pic>`;
+}
+function buildGroupXml(shape, imageRefs, hyperlinks) {
+  const id = nextShapeId();
+  const name = shape.name ?? `Group ${id}`;
+  const nvGrpSpPr = `<p:nvGrpSpPr>` + `<p:cNvPr id="${id}" name="${escapeXml3(name)}"/>` + `<p:cNvGrpSpPr/>` + `<p:nvPr/>` + `</p:nvGrpSpPr>`;
+  const t = shape.transform;
+  const grpSpPr = `<p:grpSpPr>` + `<a:xfrm>` + `<a:off x="${t.xEmu}" y="${t.yEmu}"/>` + `<a:ext cx="${t.widthEmu}" cy="${t.heightEmu}"/>` + `<a:chOff x="${t.xEmu}" y="${t.yEmu}"/>` + `<a:chExt cx="${t.widthEmu}" cy="${t.heightEmu}"/>` + `</a:xfrm></p:grpSpPr>`;
+  const childShapes = (shape.children ?? []).map((c) => buildShapeXml(c, imageRefs, hyperlinks)).join("");
+  return `<p:grpSp>${nvGrpSpPr}${grpSpPr}${childShapes}</p:grpSp>`;
+}
+function buildConnectorXml(shape) {
+  const id = nextShapeId();
+  const name = shape.name ?? `Connector ${id}`;
+  const preset = shape.presetShape ?? "straightConnector1";
+  const nvCxnSpPr = `<p:nvCxnSpPr>` + `<p:cNvPr id="${id}" name="${escapeXml3(name)}"/>` + `<p:cNvCxnSpPr/>` + `<p:nvPr/>` + `</p:nvCxnSpPr>`;
+  const spPr = buildShapeProperties({ ...shape, presetShape: preset });
+  return `<p:cxnSp>${nvCxnSpPr}${spPr}</p:cxnSp>`;
+}
+function buildTableXml(shape) {
+  if (!shape.table)
+    return buildSpShapeXml({ ...shape, type: "shape" });
+  const id = nextShapeId();
+  const name = shape.name ?? `Table ${id}`;
+  const t = shape.transform;
+  const nvGraphicFramePr = `<p:nvGraphicFramePr>` + `<p:cNvPr id="${id}" name="${escapeXml3(name)}"/>` + `<p:cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/></p:cNvGraphicFramePr>` + `<p:nvPr/>` + `</p:nvGraphicFramePr>`;
+  const xfrm = `<p:xfrm><a:off x="${t.xEmu}" y="${t.yEmu}"/><a:ext cx="${t.widthEmu}" cy="${t.heightEmu}"/></p:xfrm>`;
+  const tbl = buildTableContentXml(shape.table);
+  return `<p:graphicFrame>${nvGraphicFramePr}${xfrm}` + `<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table">` + tbl + `</a:graphicData></a:graphic></p:graphicFrame>`;
+}
+function buildTableContentXml(table) {
+  const gridCols = table.columnWidthsEmu.map((w) => `<a:gridCol w="${w}"/>`).join("");
+  const rows = table.rows.map((row) => {
+    const cells = row.cells.map((cell) => {
+      const attrs = [];
+      if (cell.colSpan && cell.colSpan > 1)
+        attrs.push(`gridSpan="${cell.colSpan}"`);
+      if (cell.rowSpan && cell.rowSpan > 1)
+        attrs.push(`rowSpan="${cell.rowSpan}"`);
+      const txBody = cell.text ? buildTextBodyXml(cell.text) : `<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="en-US"/></a:p></p:txBody>`;
+      const tcPr = cell.fill ? `<a:tcPr>${buildFillXml(cell.fill)}</a:tcPr>` : `<a:tcPr/>`;
+      return `<a:tc${attrs.length > 0 ? " " + attrs.join(" ") : ""}>${txBody}${tcPr}</a:tc>`;
+    }).join("");
+    return `<a:tr h="${row.heightEmu}">${cells}</a:tr>`;
+  }).join("");
+  return `<a:tbl><a:tblPr/><a:tblGrid>${gridCols}</a:tblGrid>${rows}</a:tbl>`;
+}
+function buildShapeProperties(shape) {
+  const parts = [];
+  parts.push(buildTransformXml(shape.transform));
+  const preset = shape.presetShape ?? "rect";
+  parts.push(`<a:prstGeom prst="${preset}"><a:avLst/></a:prstGeom>`);
+  if (shape.fill) {
+    parts.push(buildFillXml(shape.fill));
+  }
+  if (shape.line) {
+    parts.push(buildLineXml(shape.line));
+  }
+  return `<p:spPr>${parts.join("")}</p:spPr>`;
+}
+function buildTransformXml(t) {
+  const attrs = [];
+  if (t.rotation && t.rotation !== 0) {
+    attrs.push(`rot="${Math.round(t.rotation * 60000)}"`);
+  }
+  if (t.flipH)
+    attrs.push(`flipH="1"`);
+  if (t.flipV)
+    attrs.push(`flipV="1"`);
+  return `<a:xfrm${attrs.length > 0 ? " " + attrs.join(" ") : ""}>` + `<a:off x="${t.xEmu}" y="${t.yEmu}"/>` + `<a:ext cx="${t.widthEmu}" cy="${t.heightEmu}"/>` + `</a:xfrm>`;
+}
+function buildFillXml(fill) {
+  switch (fill.type) {
+    case "none":
+      return `<a:noFill/>`;
+    case "solid":
+      return `<a:solidFill><a:srgbClr val="${fill.color}"/></a:solidFill>`;
+    case "gradient": {
+      const stops = fill.stops.map((s) => `<a:gs pos="${Math.round(s.position * 1e5)}"><a:srgbClr val="${s.color}"/></a:gs>`).join("");
+      return `<a:gradFill><a:gsLst>${stops}</a:gsLst>` + `<a:lin ang="${Math.round(fill.angle * 60000)}" scaled="1"/></a:gradFill>`;
+    }
+  }
+}
+function buildLineXml(line) {
+  const attrs = [];
+  attrs.push(`w="${line.widthEmu}"`);
+  const children = [];
+  if (line.color) {
+    children.push(`<a:solidFill><a:srgbClr val="${line.color}"/></a:solidFill>`);
+  }
+  if (line.dashStyle && line.dashStyle !== "solid") {
+    const dashMap = {
+      dash: "dash",
+      dot: "dot",
+      dashDot: "dashDot",
+      dashDotDot: "lgDashDotDot"
+    };
+    children.push(`<a:prstDash val="${dashMap[line.dashStyle] ?? "solid"}"/>`);
+  }
+  return `<a:ln ${attrs.join(" ")}>${children.join("")}</a:ln>`;
+}
+function hasCrop(p) {
+  return !!(p.cropLeft || p.cropTop || p.cropRight || p.cropBottom);
+}
+function pct2(value) {
+  if (!value)
+    return "0";
+  return String(Math.round(value * 1e5));
+}
+
+// packages/@oxen-office/ppt/src/converter/slide-xml.ts
+function buildSlideXml(slide, imageRefs, hyperlinks) {
+  resetShapeIdCounter();
+  const shapes = slide.shapes.map((s) => buildShapeXml(s, imageRefs, hyperlinks)).join("");
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` + `<p:sld ` + `xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" ` + `xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" ` + `xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">` + `<p:cSld><p:spTree>` + `<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>` + `<p:grpSpPr/>` + shapes + `</p:spTree></p:cSld>` + `</p:sld>`;
+}
+
+// packages/@oxen-office/ppt/src/converter/image-embed.ts
+function contentTypeToExtension(contentType) {
+  const mapping = {
+    "image/jpeg": "jpeg",
+    "image/png": "png",
+    "image/bmp": "bmp",
+    "image/x-emf": "emf",
+    "image/x-wmf": "wmf",
+    "image/tiff": "tiff",
+    "image/pict": "pict"
+  };
+  return mapping[contentType] ?? "png";
+}
+function embedSlideImages(pkg, images, usedImageIndices, slideIndex, startRId) {
+  const imageMap = new Map;
+  const extensions = new Set;
+  let rIdCounter = startRId;
+  for (const idx of usedImageIndices) {
+    const image = images.find((img) => img.index === idx);
+    if (!image)
+      continue;
+    const ext = contentTypeToExtension(image.contentType);
+    extensions.add(ext);
+    const mediaPath = `ppt/media/image${slideIndex}_${idx}.${ext}`;
+    const rId = `rId${rIdCounter++}`;
+    const buf = new Uint8Array(image.data.byteLength);
+    buf.set(image.data);
+    pkg.writeBinary(mediaPath, buf.buffer);
+    imageMap.set(idx, { rId, mediaPath });
+  }
+  return { imageMap, extensions: Array.from(extensions) };
+}
+function buildImageRelationships(imageMap) {
+  const rels = [];
+  for (const [, { rId, mediaPath }] of imageMap) {
+    rels.push({
+      id: rId,
+      type: RT_IMAGE,
+      target: `../${mediaPath.replace("ppt/", "")}`
+    });
+  }
+  return rels;
+}
+function collectUsedImageIndices(shapes) {
+  const indices = new Set;
+  function walk(shape) {
+    if (shape.picture) {
+      indices.add(shape.picture.pictureIndex);
+    }
+    if (shape.children) {
+      for (const child of shape.children) {
+        walk(child);
+      }
+    }
+  }
+  for (const shape of shapes) {
+    walk(shape);
+  }
+  return indices;
+}
+
+// packages/@oxen-office/ppt/src/converter/index.ts
+function convertPptToPptx(ppt, _ctx) {
+  const pkg = createEmptyZipPackage();
+  const slideCount = ppt.slides.length;
+  pkg.writeText("_rels/.rels", ROOT_RELS_XML);
+  pkg.writeText("docProps/app.xml", APP_XML);
+  pkg.writeText("ppt/theme/theme1.xml", MINIMAL_THEME);
+  pkg.writeText("ppt/slideMasters/slideMaster1.xml", MINIMAL_SLIDE_MASTER);
+  pkg.writeText("ppt/slideMasters/_rels/slideMaster1.xml.rels", buildMasterRelsXml());
+  pkg.writeText("ppt/slideLayouts/slideLayout1.xml", MINIMAL_SLIDE_LAYOUT);
+  pkg.writeText("ppt/slideLayouts/_rels/slideLayout1.xml.rels", buildLayoutRelsXml());
+  const hasNotes = [];
+  const allImageExtensions = new Set;
+  for (let i2 = 0;i2 < slideCount; i2++) {
+    const slide = ppt.slides[i2];
+    const slideIdx = i2 + 1;
+    const usedIndices = collectUsedImageIndices(slide.shapes);
+    const embedResult = embedSlideImages(pkg, ppt.images, usedIndices, slideIdx, 2);
+    for (const ext of embedResult.extensions) {
+      allImageExtensions.add(ext);
+    }
+    const imageRefs = new Map;
+    for (const [idx, { rId }] of embedResult.imageMap) {
+      imageRefs.set(idx, rId);
+    }
+    const hyperlinkRels = [];
+    const hyperlinkMap = new Map;
+    collectHyperlinks(slide, hyperlinkMap, hyperlinkRels, embedResult.imageMap.size + 2);
+    const extraRels = [
+      ...buildImageRelationships(embedResult.imageMap),
+      ...hyperlinkRels
+    ];
+    const slideHasNotes = !!slide.notes;
+    hasNotes.push(slideHasNotes);
+    if (slideHasNotes) {
+      const notesRId = `rId${extraRels.length + 2}`;
+      extraRels.push({
+        id: notesRId,
+        type: RT_NOTES,
+        target: `../notesSlides/notesSlide${slideIdx}.xml`
+      });
+      pkg.writeText(`ppt/notesSlides/notesSlide${slideIdx}.xml`, buildNotesSlideXml(slide.notes));
+      pkg.writeText(`ppt/notesSlides/_rels/notesSlide${slideIdx}.xml.rels`, buildNotesRelsXml(slideIdx));
+    }
+    const slideXml = buildSlideXml(slide, imageRefs, hyperlinkMap);
+    pkg.writeText(`ppt/slides/slide${slideIdx}.xml`, slideXml);
+    pkg.writeText(`ppt/slides/_rels/slide${slideIdx}.xml.rels`, buildSlideRelsXml(extraRels));
+  }
+  pkg.writeText("ppt/presentation.xml", buildPresentationXml(slideCount, ppt.slideSize));
+  pkg.writeText("ppt/_rels/presentation.xml.rels", buildPresentationRelsXml(slideCount));
+  pkg.writeText("[Content_Types].xml", buildContentTypesXml(slideCount, {
+    hasNotes,
+    imageExtensions: Array.from(allImageExtensions)
+  }));
+  return { pkg };
+}
+function collectHyperlinks(slide, hyperlinkMap, rels, startRId) {
+  let rIdCounter = startRId;
+  function walkShape(shape) {
+    if (shape.textBody) {
+      for (const para of shape.textBody.paragraphs) {
+        for (const run of para.runs) {
+          if (run.properties.hyperlink && !hyperlinkMap.has(run.properties.hyperlink)) {
+            const rId = `rId${rIdCounter++}`;
+            hyperlinkMap.set(run.properties.hyperlink, rId);
+            rels.push({
+              id: rId,
+              type: RT_HYPERLINK,
+              target: run.properties.hyperlink,
+              targetMode: "External"
+            });
+          }
+        }
+      }
+    }
+    if (shape.children) {
+      for (const child of shape.children) {
+        walkShape(child);
+      }
+    }
+  }
+  for (const shape of slide.shapes) {
+    walkShape(shape);
+  }
+}
+
+// packages/@oxen-office/ppt/src/parser.ts
+function createCfbWarningSink(warn) {
+  if (!warn)
+    return;
+  return (warning) => {
+    const base = { where: `CFB:${warning.where}`, message: warning.message, ...warning.meta ? { meta: warning.meta } : {} };
+    const codeMapping = {
+      FAT_CHAIN_INVALID: "CFB_FAT_CHAIN_INVALID",
+      FAT_CHAIN_TOO_SHORT: "CFB_FAT_CHAIN_TOO_SHORT",
+      FAT_CHAIN_LENGTH_MISMATCH: "CFB_FAT_CHAIN_LENGTH_MISMATCH",
+      FAT_SECTOR_READ_FAILED: "CFB_FAT_SECTOR_READ_FAILED",
+      MINIFAT_CHAIN_INVALID: "CFB_MINIFAT_CHAIN_INVALID",
+      MINIFAT_CHAIN_TOO_SHORT: "CFB_MINIFAT_CHAIN_TOO_SHORT",
+      MINIFAT_CHAIN_LENGTH_MISMATCH: "CFB_MINIFAT_CHAIN_LENGTH_MISMATCH",
+      MINISTREAM_TRUNCATED: "CFB_MINISTREAM_TRUNCATED"
+    };
+    const code = codeMapping[warning.code];
+    if (code)
+      warn({ code, ...base });
+  };
+}
+function createContext(options) {
+  return { mode: options?.mode ?? "strict", ...options?.onWarning ? { warn: options.onWarning } : {} };
+}
+function readStreamSafe(cfb, path) {
+  try {
+    return cfb.readStream(path);
+  } catch {
+    return;
+  }
+}
+function parsePptFromBytes(bytes, ctx) {
+  const cfbWarningSink = createCfbWarningSink(ctx.warn);
+  const strict = isStrict(ctx);
+  const cfb = openCfb(bytes, { strict, ...cfbWarningSink ? { onWarning: cfbWarningSink } : {} });
+  const docStream = readStreamSafe(cfb, ["PowerPoint Document"]);
+  if (!docStream) {
+    throw new Error("PowerPoint Document stream not found in CFB container");
+  }
+  const currentUserStream = readStreamSafe(cfb, ["Current User"]);
+  const picturesStream = readStreamSafe(cfb, ["Pictures"]);
+  const parsed = parsePptDocumentStream(docStream, currentUserStream, ctx);
+  const images = picturesStream ? parsePicturesStream(picturesStream) : [];
+  const presentation = extractPptPresentation(parsed, images, ctx);
+  const { pkg } = convertPptToPptx(presentation, ctx);
+  return { presentation, pkg };
+}
+function parsePptWithReport(bytes, options) {
+  if (!(bytes instanceof Uint8Array)) {
+    throw new Error("parsePptWithReport: bytes must be a Uint8Array");
+  }
+  const collector = createPptWarningCollector();
+  const ctx = createContext({ ...options?.mode ? { mode: options.mode } : {}, onWarning: collector.warn });
+  const { presentation, pkg } = parsePptFromBytes(bytes, ctx);
+  return { presentation, pkg, warnings: collector.warnings };
+}
+// packages/@oxen-converters/ppt-to-pptx/src/index.ts
+function convert(input, options) {
+  options?.onProgress?.({ current: 0, total: 1, phase: "converting" });
+  const result = parsePptWithReport(input, { mode: "lenient" });
+  options?.onProgress?.({ current: 1, total: 1, phase: "done" });
+  return {
+    data: result.pkg,
+    warnings: result.warnings.map((w) => ({
+      code: w.code,
+      message: w.message,
+      where: w.where,
+      ...w.meta ? { meta: w.meta } : {}
+    }))
+  };
+}
+
+// packages/@oxen-cli/pptx-cli/src/commands/loader.ts
+async function loadPresentationBundle(filePath) {
+  const buffer = await fs.readFile(filePath);
+  if (extname(filePath).toLowerCase() === ".ppt") {
+    const { data } = convert(new Uint8Array(buffer));
+    const pptxBuffer = await data.toArrayBuffer();
+    return loadPptxBundleFromBuffer(pptxBuffer);
+  }
+  return loadPptxBundleFromBuffer(buffer);
+}
 // packages/@oxen-cli/cli-core/src/result.ts
 function success(data) {
   return { success: true, data };
@@ -20194,12 +23143,13 @@ function formatJson(result) {
   return JSON.stringify(result, null, 2);
 }
 // packages/@oxen-cli/cli-core/src/output-handler.ts
-function output(result, mode, prettyFormatter) {
+function output(result, mode, prettyFormatter, mermaidFormatter) {
   if (mode === "json") {
     console.log(formatJson(result));
   } else {
+    const formatter = mode === "mermaid" && mermaidFormatter ? mermaidFormatter : prettyFormatter;
     if (result.success) {
-      console.log(prettyFormatter(result.data));
+      console.log(formatter(result.data));
     } else {
       console.error(`Error [${result.error.code}]: ${result.error.message}`);
     }
@@ -20211,8 +23161,7 @@ function output(result, mode, prettyFormatter) {
 // packages/@oxen-cli/pptx-cli/src/commands/info.ts
 async function runInfo(filePath) {
   try {
-    const buffer = await fs.readFile(filePath);
-    const { presentationFile } = await loadPptxBundleFromBuffer(buffer);
+    const { presentationFile } = await loadPresentationBundle(filePath);
     const presentation = openPresentation(presentationFile);
     const widthEmu = Math.round(presentation.size.width * EMU_PER_PIXEL);
     const heightEmu = Math.round(presentation.size.height * EMU_PER_PIXEL);
@@ -20233,9 +23182,6 @@ async function runInfo(filePath) {
     return error("PARSE_ERROR", `Failed to parse PPTX: ${err2.message}`);
   }
 }
-
-// packages/@oxen-cli/pptx-cli/src/commands/list.ts
-import * as fs2 from "fs/promises";
 
 // packages/@oxen-office/pptx/src/domain/text-utils.ts
 function extractTextFromBody(textBody) {
@@ -20265,6 +23211,66 @@ function extractTextFromShape(shape) {
 `);
   }
   return "";
+}
+
+// packages/@oxen-cli/pptx-cli/src/commands/utils.ts
+function parseRangePart(part, maxSlide, result) {
+  if (part.includes("-")) {
+    const [startStr, endStr] = part.split("-").map((s) => s.trim());
+    const start = parseInt(startStr, 10);
+    const end = parseInt(endStr, 10);
+    if (Number.isNaN(start) || Number.isNaN(end)) {
+      return;
+    }
+    for (let i2 = Math.max(1, start);i2 <= Math.min(maxSlide, end); i2++) {
+      if (!result.includes(i2)) {
+        result.push(i2);
+      }
+    }
+  } else {
+    const num = parseInt(part, 10);
+    if (!Number.isNaN(num) && num >= 1 && num <= maxSlide && !result.includes(num)) {
+      result.push(num);
+    }
+  }
+}
+function parseSlideRange(range2, maxSlide) {
+  const result = [];
+  const parts = range2.split(",").map((s) => s.trim());
+  for (const part of parts) {
+    parseRangePart(part, maxSlide, result);
+  }
+  return result.sort((a, b) => a - b);
+}
+function getSlideNumbers(slidesOption, count) {
+  if (slidesOption) {
+    return parseSlideRange(slidesOption, count);
+  }
+  return Array.from({ length: count }, (_, i2) => i2 + 1);
+}
+function hasShapeOfType(shapes, check) {
+  for (const shape of shapes) {
+    if (check(shape)) {
+      return true;
+    }
+    if (shape.type === "grpSp" && hasShapeOfType(shape.children, check)) {
+      return true;
+    }
+  }
+  return false;
+}
+function collectShapes(shapes, collector) {
+  const results = [];
+  for (const shape of shapes) {
+    const result = collector(shape);
+    if (result !== undefined) {
+      results.push(result);
+    }
+    if (shape.type === "grpSp") {
+      results.push(...collectShapes(shape.children, collector));
+    }
+  }
+  return results;
 }
 
 // packages/@oxen-cli/pptx-cli/src/commands/list.ts
@@ -20297,17 +23303,6 @@ function countShapesRecursive(shapes, initial) {
 function countShapes(shapes) {
   return countShapesRecursive(shapes, 0);
 }
-function hasShapeOfType(shapes, check) {
-  for (const shape of shapes) {
-    if (check(shape)) {
-      return true;
-    }
-    if (shape.type === "grpSp" && hasShapeOfType(shape.children, check)) {
-      return true;
-    }
-  }
-  return false;
-}
 function hasTable(shapes) {
   return hasShapeOfType(shapes, (s) => s.type === "graphicFrame" && s.content.type === "table");
 }
@@ -20319,8 +23314,7 @@ function hasImage(shapes) {
 }
 async function runList(filePath) {
   try {
-    const buffer = await fs2.readFile(filePath);
-    const { presentationFile } = await loadPptxBundleFromBuffer(buffer);
+    const { presentationFile } = await loadPresentationBundle(filePath);
     const presentation = openPresentation(presentationFile);
     const items = [];
     for (const apiSlide of presentation.slides()) {
@@ -20345,9 +23339,6 @@ async function runList(filePath) {
     return error("PARSE_ERROR", `Failed to parse PPTX: ${err2.message}`);
   }
 }
-
-// packages/@oxen-cli/pptx-cli/src/commands/show.ts
-import * as fs3 from "fs/promises";
 
 // packages/@oxen-cli/pptx-cli/src/serializers/shape-serializer.ts
 function serializeBounds(transform) {
@@ -20994,8 +23985,7 @@ function collectChartResourceIds(shapes) {
 }
 async function runShow(filePath, slideNumber) {
   try {
-    const buffer = await fs3.readFile(filePath);
-    const { zipPackage, presentationFile } = await loadPptxBundleFromBuffer(buffer);
+    const { zipPackage, presentationFile } = await loadPresentationBundle(filePath);
     const presentation = openPresentation(presentationFile);
     if (slideNumber < 1 || slideNumber > presentation.count) {
       return error("SLIDE_NOT_FOUND", `Slide ${slideNumber} not found. Valid range: 1-${presentation.count}`);
@@ -21030,35 +24020,6 @@ async function runShow(filePath, slideNumber) {
 }
 
 // packages/@oxen-cli/pptx-cli/src/commands/extract.ts
-import * as fs4 from "fs/promises";
-function parseRangePart(part, maxSlide, result) {
-  if (part.includes("-")) {
-    const [startStr, endStr] = part.split("-").map((s) => s.trim());
-    const start = parseInt(startStr, 10);
-    const end = parseInt(endStr, 10);
-    if (Number.isNaN(start) || Number.isNaN(end)) {
-      return;
-    }
-    for (let i2 = Math.max(1, start);i2 <= Math.min(maxSlide, end); i2++) {
-      if (!result.includes(i2)) {
-        result.push(i2);
-      }
-    }
-  } else {
-    const num = parseInt(part, 10);
-    if (!Number.isNaN(num) && num >= 1 && num <= maxSlide && !result.includes(num)) {
-      result.push(num);
-    }
-  }
-}
-function parseSlideRange(range2, maxSlide) {
-  const result = [];
-  const parts = range2.split(",").map((s) => s.trim());
-  for (const part of parts) {
-    parseRangePart(part, maxSlide, result);
-  }
-  return result.sort((a, b) => a - b);
-}
 function collectAllText(shapes) {
   const texts = [];
   for (const shape of shapes) {
@@ -21072,18 +24033,11 @@ function collectAllText(shapes) {
   }
   return texts;
 }
-function getSlideNumbers(options, count) {
-  if (options.slides) {
-    return parseSlideRange(options.slides, count);
-  }
-  return Array.from({ length: count }, (_, i2) => i2 + 1);
-}
 async function runExtract(filePath, options) {
   try {
-    const buffer = await fs4.readFile(filePath);
-    const { presentationFile } = await loadPptxBundleFromBuffer(buffer);
+    const { presentationFile } = await loadPresentationBundle(filePath);
     const presentation = openPresentation(presentationFile);
-    const slideNumbers = getSlideNumbers(options, presentation.count);
+    const slideNumbers = getSlideNumbers(options.slides, presentation.count);
     const items = [];
     for (const slideNumber of slideNumbers) {
       const apiSlide = presentation.getSlide(slideNumber);
@@ -21106,11 +24060,9 @@ async function runExtract(filePath, options) {
 }
 
 // packages/@oxen-cli/pptx-cli/src/commands/theme.ts
-import * as fs5 from "fs/promises";
 async function runTheme(filePath) {
   try {
-    const buffer = await fs5.readFile(filePath);
-    const { presentationFile } = await loadPptxBundleFromBuffer(buffer);
+    const { presentationFile } = await loadPresentationBundle(filePath);
     const presentation = openPresentation(presentationFile);
     const slide = presentation.getSlide(1);
     const theme = parseTheme(slide.theme, slide.themeOverrides);
@@ -21155,11 +24107,11 @@ async function runTheme(filePath) {
 }
 
 // packages/@oxen-cli/pptx-cli/src/commands/build.ts
-import * as fs7 from "fs/promises";
+import * as fs3 from "fs/promises";
 import * as path4 from "path";
 
 // packages/@oxen-builder/pptx/src/builders/file-utils.ts
-import * as fs6 from "fs/promises";
+import * as fs2 from "fs/promises";
 import * as path from "path";
 var IMAGE_EXT_MAP = {
   ".png": "image/png",
@@ -21177,7 +24129,7 @@ function detectImageMimeType(filePath) {
   return mimeType;
 }
 async function readFileToArrayBuffer(filePath) {
-  const buffer = await fs6.readFile(filePath);
+  const buffer = await fs2.readFile(filePath);
   const arrayBuffer = new ArrayBuffer(buffer.length);
   new Uint8Array(arrayBuffer).set(buffer);
   return arrayBuffer;
@@ -27054,7 +30006,7 @@ function buildHyperlink(spec) {
     tooltip: spec.tooltip
   };
 }
-function buildRunProperties(spec) {
+function buildRunProperties3(spec) {
   if (spec.bold !== undefined || spec.italic !== undefined || spec.underline !== undefined || spec.strikethrough !== undefined || spec.caps !== undefined || spec.verticalPosition !== undefined || spec.letterSpacing !== undefined || spec.fontSize !== undefined || spec.fontFamily !== undefined || spec.color !== undefined || spec.outline !== undefined || spec.effects !== undefined || spec.hyperlink !== undefined) {
     const properties = {};
     if (spec.bold !== undefined) {
@@ -27101,7 +30053,7 @@ function buildRunProperties(spec) {
   return;
 }
 function buildTextRun(spec) {
-  const properties = buildRunProperties(spec);
+  const properties = buildRunProperties3(spec);
   return {
     type: "text",
     text: spec.text,
@@ -27164,7 +30116,7 @@ function buildParagraph(spec) {
 function isRichText(text) {
   return Array.isArray(text);
 }
-function buildBodyProperties(spec) {
+function buildBodyProperties2(spec) {
   if (!spec) {
     return {};
   }
@@ -27192,7 +30144,7 @@ function buildBodyProperties(spec) {
   return props;
 }
 function buildTextBody(text, bodyPropertiesSpec) {
-  const bodyProperties = buildBodyProperties(bodyPropertiesSpec);
+  const bodyProperties = buildBodyProperties2(bodyPropertiesSpec);
   if (isRichText(text)) {
     return {
       bodyProperties,
@@ -27204,7 +30156,7 @@ function buildTextBody(text, bodyPropertiesSpec) {
     paragraphs: [{ properties: {}, runs: [{ type: "text", text }] }]
   };
 }
-function collectHyperlinks(text) {
+function collectHyperlinks2(text) {
   const hyperlinks = [];
   if (!isRichText(text)) {
     return hyperlinks;
@@ -27298,7 +30250,7 @@ function registerHyperlinks(text, ctx) {
   if (!text) {
     return urlToRid;
   }
-  const hyperlinks = collectHyperlinks(text);
+  const hyperlinks = collectHyperlinks2(text);
   if (hyperlinks.length === 0) {
     return urlToRid;
   }
@@ -27340,13 +30292,13 @@ function replaceHyperlinkUrls(element, urlToRid) {
   });
   return { ...element, children };
 }
-function buildShapeXml(spec, id, urlToRid) {
+function buildShapeXml2(spec, id, urlToRid) {
   const baseXml = serializeShape2(buildSpShape(spec, id));
   return urlToRid.size > 0 ? replaceHyperlinkUrls(baseXml, urlToRid) : baseXml;
 }
 var shapeBuilder = (spec, id, ctx) => {
   const urlToRid = registerHyperlinks(spec.text, ctx);
-  const xml = buildShapeXml(spec, id, urlToRid);
+  const xml = buildShapeXml2(spec, id, urlToRid);
   return { xml };
 };
 function buildPicShape({
@@ -28644,7 +31596,7 @@ function buildBlankSlideXml() {
 function normalizeLayoutPath(layoutPath) {
   return layoutPath.startsWith("ppt/") ? `../${layoutPath.slice(4)}` : layoutPath;
 }
-function buildSlideRelsXml(layoutPath) {
+function buildSlideRelsXml2(layoutPath) {
   const targetFromSlides = normalizeLayoutPath(layoutPath);
   return {
     children: [
@@ -28674,7 +31626,7 @@ function addSlideToPackage(pkg, spec) {
   const slidePath = `ppt/slides/${slideFilename}.xml`;
   const slideRelsPath = `ppt/slides/_rels/${slideFilename}.xml.rels`;
   writeXml(pkg, slidePath, buildBlankSlideXml());
-  writeXml(pkg, slideRelsPath, buildSlideRelsXml(spec.layoutPath));
+  writeXml(pkg, slideRelsPath, buildSlideRelsXml2(spec.layoutPath));
   const updatedPresentationXml = addSlideToList({
     presentationXml,
     slideId,
@@ -28973,11 +31925,11 @@ async function processSlide(ctx, slideMod) {
 }
 async function runBuild(specPath) {
   try {
-    const specJson = await fs7.readFile(specPath, "utf-8");
+    const specJson = await fs3.readFile(specPath, "utf-8");
     const spec = JSON.parse(specJson);
     const specDir = path4.dirname(specPath);
     const templatePath = path4.resolve(specDir, spec.template);
-    const templateBuffer = await fs7.readFile(templatePath);
+    const templateBuffer = await fs3.readFile(templatePath);
     const { zipPackage, presentationFile } = await loadPptxBundleFromBuffer(templateBuffer);
     if (spec.theme) {
       applyThemeEditsToPackage(zipPackage, spec.theme);
@@ -29011,9 +31963,9 @@ async function runBuild(specPath) {
     }
     const shapesAdded = processResults.filter((r) => r.success).reduce((sum, r) => sum + r.shapesAdded, 0);
     const outputPath = path4.resolve(specDir, spec.output);
-    await fs7.mkdir(path4.dirname(outputPath), { recursive: true });
+    await fs3.mkdir(path4.dirname(outputPath), { recursive: true });
     const outputBuffer = await zipPackage.toArrayBuffer();
-    await fs7.writeFile(outputPath, Buffer.from(outputBuffer));
+    await fs3.writeFile(outputPath, Buffer.from(outputBuffer));
     return success({ outputPath: spec.output, slideCount: presentation.count, shapesAdded });
   } catch (err2) {
     if (err2.code === "ENOENT") {
@@ -29027,7 +31979,7 @@ async function runBuild(specPath) {
 }
 
 // packages/@oxen-cli/pptx-cli/src/commands/verify.ts
-import * as fs8 from "fs/promises";
+import * as fs4 from "fs/promises";
 import * as path5 from "path";
 function createAssertion(path6, expected, actual) {
   return {
@@ -29284,9 +32236,9 @@ async function runTestCase(spec, specDir) {
     template: path5.resolve(specDir, spec.input.template),
     output: path5.resolve(specDir, spec.input.output)
   };
-  await fs8.mkdir(path5.dirname(input.output), { recursive: true });
+  await fs4.mkdir(path5.dirname(input.output), { recursive: true });
   const tempSpecPath = path5.join(path5.dirname(input.output), `${spec.name}.build.json`);
-  await fs8.writeFile(tempSpecPath, JSON.stringify(input, null, 2));
+  await fs4.writeFile(tempSpecPath, JSON.stringify(input, null, 2));
   try {
     const buildResult = await runBuild(tempSpecPath);
     if (!buildResult.success) {
@@ -29312,15 +32264,15 @@ async function runTestCase(spec, specDir) {
     const passed = assertions.every((a) => a.passed);
     return { name: spec.name, passed, assertions };
   } finally {
-    await fs8.unlink(tempSpecPath).catch(() => {});
+    await fs4.unlink(tempSpecPath).catch(() => {});
   }
 }
 async function findTestCaseFiles(targetPath) {
-  const stat2 = await fs8.stat(targetPath);
+  const stat2 = await fs4.stat(targetPath);
   if (stat2.isFile()) {
     return [targetPath];
   }
-  const entries = await fs8.readdir(targetPath, { withFileTypes: true });
+  const entries = await fs4.readdir(targetPath, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
     if (entry.isFile() && entry.name.endsWith(".json") && !entry.name.includes(".build.")) {
@@ -29333,7 +32285,7 @@ async function findTestCaseFiles(targetPath) {
   return files.sort();
 }
 async function loadTestCase(filePath) {
-  const content = await fs8.readFile(filePath, "utf-8");
+  const content = await fs4.readFile(filePath, "utf-8");
   return JSON.parse(content);
 }
 async function runVerify(specPath, options = {}) {
@@ -29369,9 +32321,6 @@ async function runVerify(specPath, options = {}) {
     return error("VERIFY_ERROR", `Verification failed: ${err2.message}`);
   }
 }
-
-// packages/@oxen-cli/pptx-cli/src/commands/preview.ts
-import * as fs9 from "fs/promises";
 
 // packages/@oxen-office/pptx/src/domain/resource-store.ts
 function createResourceStore() {
@@ -29825,8 +32774,8 @@ function renderPieAscii(params) {
     const marker = PIE_MARKERS[i2 % PIE_MARKERS.length];
     const label = truncateText(categories[i2] ?? `Item ${i2 + 1}`, maxCatLen);
     const paddedLabel = label.padEnd(maxCatLen);
-    const pct2 = Math.abs(values[i2]) / total * 100;
-    const pctStr = pct2.toFixed(1).padStart(5) + "%";
+    const pct3 = Math.abs(values[i2]) / total * 100;
+    const pctStr = pct3.toFixed(1).padStart(5) + "%";
     const barWidth = Math.round(Math.abs(values[i2]) / total * barMaxWidth);
     const bar = BAR_CHAR2.repeat(barWidth);
     lines.push(`${marker} ${paddedLabel}  ${pctStr}  ${bar}`);
@@ -30046,8 +32995,7 @@ function renderSlideAscii(params) {
 // packages/@oxen-cli/pptx-cli/src/commands/preview.ts
 async function runPreview(filePath, slideNumber, options) {
   try {
-    const buffer = await fs9.readFile(filePath);
-    const { presentationFile } = await loadPptxBundleFromBuffer(buffer);
+    const { presentationFile } = await loadPresentationBundle(filePath);
     const presentation = openPresentation(presentationFile);
     if (slideNumber !== undefined && (slideNumber < 1 || slideNumber > presentation.count)) {
       return error("SLIDE_NOT_FOUND", `Slide ${slideNumber} not found. Valid range: 1-${presentation.count}`);
@@ -30090,6 +33038,7 @@ async function runPreview(filePath, slideNumber, options) {
         number: apiSlide.number,
         filename: apiSlide.filename,
         ascii,
+        shapes,
         shapeCount: shapes.length
       });
     }
@@ -30104,6 +33053,210 @@ async function runPreview(filePath, slideNumber, options) {
     }
     return error("PARSE_ERROR", `Failed to parse PPTX: ${err2.message}`);
   }
+}
+
+// packages/@oxen-cli/pptx-cli/src/commands/inventory.ts
+async function runInventory(filePath) {
+  try {
+    const { presentationFile } = await loadPresentationBundle(filePath);
+    const presentation = openPresentation(presentationFile);
+    let totalImages = 0;
+    let totalTables = 0;
+    let totalCharts = 0;
+    let totalDiagrams = 0;
+    const textOnlySlides = [];
+    for (const apiSlide of presentation.slides()) {
+      const domainSlide = parseSlide(apiSlide.content);
+      const shapes = domainSlide?.shapes ?? [];
+      const images = collectShapes(shapes, (s) => s.type === "pic" ? true : undefined);
+      const tables = collectShapes(shapes, (s) => s.type === "graphicFrame" && s.content.type === "table" ? true : undefined);
+      const charts = collectShapes(shapes, (s) => s.type === "graphicFrame" && s.content.type === "chart" ? true : undefined);
+      const diagrams = collectShapes(shapes, (s) => s.type === "graphicFrame" && s.content.type === "diagram" ? true : undefined);
+      totalImages += images.length;
+      totalTables += tables.length;
+      totalCharts += charts.length;
+      totalDiagrams += diagrams.length;
+      if (images.length === 0 && tables.length === 0 && charts.length === 0 && diagrams.length === 0) {
+        textOnlySlides.push(apiSlide.number);
+      }
+    }
+    return success({
+      slides: presentation.count,
+      images: totalImages,
+      tables: totalTables,
+      charts: totalCharts,
+      diagrams: totalDiagrams,
+      textOnlySlides
+    });
+  } catch (err2) {
+    if (err2.code === "ENOENT") {
+      return error("FILE_NOT_FOUND", `File not found: ${filePath}`);
+    }
+    return error("PARSE_ERROR", `Failed to parse PPTX: ${err2.message}`);
+  }
+}
+
+// packages/@oxen-cli/pptx-cli/src/commands/tables.ts
+function getFirstCellPreview(table) {
+  const firstCell = table.rows[0]?.cells[0];
+  if (!firstCell?.textBody) {
+    return;
+  }
+  const text = extractTextFromBody(firstCell.textBody).trim();
+  if (!text) {
+    return;
+  }
+  return text.length > 50 ? text.substring(0, 50) + "..." : text;
+}
+async function runTables(filePath, options) {
+  try {
+    const { presentationFile } = await loadPresentationBundle(filePath);
+    const presentation = openPresentation(presentationFile);
+    const slideNumbers = getSlideNumbers(options.slides, presentation.count);
+    const tables = [];
+    let tableIndex = 0;
+    for (const slideNumber of slideNumbers) {
+      const apiSlide = presentation.getSlide(slideNumber);
+      const domainSlide = parseSlide(apiSlide.content);
+      const shapes = domainSlide?.shapes ?? [];
+      const foundTables = collectShapes(shapes, (s) => {
+        if (s.type === "graphicFrame" && s.content.type === "table") {
+          return s.content.data.table;
+        }
+        return;
+      });
+      for (const table of foundTables) {
+        const summary = {
+          slideNumber,
+          index: tableIndex,
+          rowCount: table.rows.length,
+          colCount: table.grid.columns.length,
+          ...table.properties.tableStyleId && { styleId: table.properties.tableStyleId },
+          ...(() => {
+            const preview = getFirstCellPreview(table);
+            return preview ? { firstCellPreview: preview } : {};
+          })()
+        };
+        tables.push(summary);
+        tableIndex++;
+      }
+    }
+    return success({ count: tables.length, tables });
+  } catch (err2) {
+    if (err2.code === "ENOENT") {
+      return error("FILE_NOT_FOUND", `File not found: ${filePath}`);
+    }
+    return error("PARSE_ERROR", `Failed to parse PPTX: ${err2.message}`);
+  }
+}
+
+// packages/@oxen-cli/pptx-cli/src/commands/images.ts
+async function runImages(filePath, options) {
+  try {
+    const { presentationFile } = await loadPresentationBundle(filePath);
+    const presentation = openPresentation(presentationFile);
+    const slideNumbers = getSlideNumbers(options.slides, presentation.count);
+    const images = [];
+    let imageIndex = 0;
+    for (const slideNumber of slideNumbers) {
+      const apiSlide = presentation.getSlide(slideNumber);
+      const domainSlide = parseSlide(apiSlide.content);
+      const shapes = domainSlide?.shapes ?? [];
+      const picShapes = collectShapes(shapes, (s) => s.type === "pic" ? s : undefined);
+      for (const pic of picShapes) {
+        const entry = {
+          slideNumber,
+          index: imageIndex,
+          resourceId: pic.blipFill.resourceId,
+          ...pic.nonVisual.name && { name: pic.nonVisual.name },
+          ...pic.nonVisual.description && { description: pic.nonVisual.description },
+          ...pic.properties.transform?.width != null && { width: Math.round(pic.properties.transform.width) },
+          ...pic.properties.transform?.height != null && { height: Math.round(pic.properties.transform.height) },
+          ...pic.mediaType && { mediaType: pic.mediaType }
+        };
+        images.push(entry);
+        imageIndex++;
+      }
+    }
+    return success({ count: images.length, images });
+  } catch (err2) {
+    if (err2.code === "ENOENT") {
+      return error("FILE_NOT_FOUND", `File not found: ${filePath}`);
+    }
+    return error("PARSE_ERROR", `Failed to parse PPTX: ${err2.message}`);
+  }
+}
+
+// packages/@oxen-cli/pptx-cli/src/commands/diff.ts
+function collectAllText2(shapes) {
+  const texts = [];
+  for (const shape of shapes) {
+    const text = extractTextFromShape(shape).trim();
+    if (text) {
+      texts.push(text);
+    }
+    if (shape.type === "grpSp") {
+      texts.push(...collectAllText2(shape.children));
+    }
+  }
+  return texts;
+}
+async function extractSlideTexts(filePath) {
+  const { presentationFile } = await loadPresentationBundle(filePath);
+  const presentation = openPresentation(presentationFile);
+  const texts = [];
+  for (const apiSlide of presentation.slides()) {
+    const domainSlide = parseSlide(apiSlide.content);
+    const shapes = domainSlide?.shapes ?? [];
+    texts.push(collectAllText2(shapes).join(`
+`));
+  }
+  return texts;
+}
+async function runDiff(fileA, fileB) {
+  let textsA;
+  try {
+    textsA = await extractSlideTexts(fileA);
+  } catch (err2) {
+    if (err2.code === "ENOENT") {
+      return error("FILE_NOT_FOUND", `File not found: ${fileA}`);
+    }
+    return error("PARSE_ERROR", `Failed to parse PPTX: ${fileA}: ${err2.message}`);
+  }
+  let textsB;
+  try {
+    textsB = await extractSlideTexts(fileB);
+  } catch (err2) {
+    if (err2.code === "ENOENT") {
+      return error("FILE_NOT_FOUND", `File not found: ${fileB}`);
+    }
+    return error("PARSE_ERROR", `Failed to parse PPTX: ${fileB}: ${err2.message}`);
+  }
+  const commonCount = Math.min(textsA.length, textsB.length);
+  const identicalSlides = [];
+  const diffSlides = [];
+  for (let i2 = 0;i2 < commonCount; i2++) {
+    if (textsA[i2] === textsB[i2]) {
+      identicalSlides.push(i2 + 1);
+    } else {
+      diffSlides.push(i2 + 1);
+    }
+  }
+  const result = {
+    fileA,
+    fileB,
+    slideCountA: textsA.length,
+    slideCountB: textsB.length,
+    identicalSlides,
+    diffSlides,
+    ...textsB.length > textsA.length && {
+      addedSlides: Array.from({ length: textsB.length - textsA.length }, (_, i2) => textsA.length + i2 + 1)
+    },
+    ...textsA.length > textsB.length && {
+      removedSlides: Array.from({ length: textsA.length - textsB.length }, (_, i2) => textsB.length + i2 + 1)
+    }
+  };
+  return success(result);
 }
 
 // packages/@oxen-cli/pptx-cli/src/output/pretty-output.ts
@@ -30296,22 +33449,391 @@ function formatVerifyPretty(data) {
   return lines.join(`
 `);
 }
+function formatInventoryPretty(data) {
+  const lines = [];
+  lines.push(`Slides: ${data.slides}`);
+  lines.push(`Images: ${data.images}`);
+  lines.push(`Tables: ${data.tables}`);
+  lines.push(`Charts: ${data.charts}`);
+  lines.push(`Diagrams: ${data.diagrams}`);
+  if (data.textOnlySlides.length > 0) {
+    lines.push(`Text-only slides: ${data.textOnlySlides.join(", ")}`);
+  } else {
+    lines.push("Text-only slides: (none)");
+  }
+  return lines.join(`
+`);
+}
+function formatTablesPretty(data) {
+  if (data.count === 0) {
+    return "No tables found";
+  }
+  const lines = [`Tables: ${data.count}`, ""];
+  for (const table of data.tables) {
+    lines.push(`Slide ${table.slideNumber}, Table ${table.index + 1}: ${table.rowCount} rows x ${table.colCount} cols`);
+    if (table.styleId) {
+      lines.push(`  Style: ${table.styleId}`);
+    }
+    if (table.firstCellPreview) {
+      lines.push(`  First cell: "${table.firstCellPreview}"`);
+    }
+  }
+  return lines.join(`
+`);
+}
+function formatImagesPretty(data) {
+  if (data.count === 0) {
+    return "No images found";
+  }
+  const lines = [`Images: ${data.count}`, ""];
+  for (const img of data.images) {
+    const name = img.name || `Image ${img.index + 1}`;
+    lines.push(`Slide ${img.slideNumber} [${img.index}] ${name}`);
+    if (img.description) {
+      lines.push(`  Description: ${img.description}`);
+    }
+    if (img.width != null && img.height != null) {
+      lines.push(`  Size: ${img.width} x ${img.height} px`);
+    }
+    lines.push(`  Resource: ${img.resourceId}`);
+    if (img.mediaType) {
+      lines.push(`  Media: ${img.mediaType}`);
+    }
+  }
+  return lines.join(`
+`);
+}
+function formatSlideRanges(numbers) {
+  if (numbers.length === 0) {
+    return "(none)";
+  }
+  const ranges = [];
+  let start = numbers[0];
+  let end = start;
+  for (let i2 = 1;i2 < numbers.length; i2++) {
+    if (numbers[i2] === end + 1) {
+      end = numbers[i2];
+    } else {
+      ranges.push(start === end ? `${start}` : `${start}-${end}`);
+      start = numbers[i2];
+      end = start;
+    }
+  }
+  ranges.push(start === end ? `${start}` : `${start}-${end}`);
+  return ranges.join(", ");
+}
+function formatDiffPretty(data) {
+  const lines = [];
+  lines.push(`File A: ${data.fileA} (${data.slideCountA} slides)`);
+  lines.push(`File B: ${data.fileB} (${data.slideCountB} slides)`);
+  lines.push("");
+  if (data.diffSlides.length === 0 && !data.addedSlides?.length && !data.removedSlides?.length) {
+    lines.push("All slides identical");
+  } else {
+    if (data.identicalSlides.length > 0) {
+      lines.push(`Identical: slides ${formatSlideRanges(data.identicalSlides)}`);
+    }
+    if (data.diffSlides.length > 0) {
+      lines.push(`Diff: slides ${formatSlideRanges(data.diffSlides)}`);
+    }
+    if (data.addedSlides && data.addedSlides.length > 0) {
+      lines.push(`Added in B: slides ${formatSlideRanges(data.addedSlides)}`);
+    }
+    if (data.removedSlides && data.removedSlides.length > 0) {
+      lines.push(`Removed from A: slides ${formatSlideRanges(data.removedSlides)}`);
+    }
+  }
+  return lines.join(`
+`);
+}
+
+// packages/@oxen/mermaid/src/escape.ts
+function escapeMermaidLabel(text) {
+  return text.replace(/"/g, "#quot;").replace(/\n/g, " ").replace(/\r/g, "");
+}
+function sanitizeNodeId(id) {
+  const sanitized = id.replace(/[^a-zA-Z0-9_]/g, "_");
+  if (/^[0-9]/.test(sanitized)) {
+    return `n${sanitized}`;
+  }
+  return sanitized || "node";
+}
+// packages/@oxen/mermaid/src/fence.ts
+function wrapInMermaidFence(content) {
+  return `\`\`\`mermaid
+${content}
+\`\`\``;
+}
+// packages/@oxen/mermaid/src/markdown-table.ts
+function escapeCell(text) {
+  return text.replace(/\|/g, "\\|").replace(/\n/g, " ");
+}
+function buildSeparator(columnCount, alignments) {
+  const cells = [];
+  for (let i2 = 0;i2 < columnCount; i2++) {
+    const align = alignments?.[i2] ?? "left";
+    switch (align) {
+      case "right":
+        cells.push("---:");
+        break;
+      case "center":
+        cells.push(":---:");
+        break;
+      case "left":
+      default:
+        cells.push("---");
+        break;
+    }
+  }
+  return `| ${cells.join(" | ")} |`;
+}
+function renderMarkdownTable(params) {
+  const { headers, rows, alignments } = params;
+  const columnCount = headers.length;
+  if (columnCount === 0) {
+    return "";
+  }
+  const lines = [];
+  const headerCells = headers.map(escapeCell);
+  lines.push(`| ${headerCells.join(" | ")} |`);
+  lines.push(buildSeparator(columnCount, alignments));
+  for (const row of rows) {
+    const cells = [];
+    for (let i2 = 0;i2 < columnCount; i2++) {
+      cells.push(escapeCell(i2 < row.length ? row[i2] : ""));
+    }
+    lines.push(`| ${cells.join(" | ")} |`);
+  }
+  return lines.join(`
+`);
+}
+// packages/@oxen-builder/mermaid/src/chart-serializer.ts
+function serializePie(input) {
+  const lines = [];
+  if (input.title) {
+    lines.push(`pie title "${escapeMermaidLabel(input.title)}"`);
+  } else {
+    lines.push("pie");
+  }
+  for (const series of input.series) {
+    const categories = series.categories ?? [];
+    for (let i2 = 0;i2 < series.values.length; i2++) {
+      const label = i2 < categories.length ? categories[i2] : `Item ${i2 + 1}`;
+      lines.push(`  "${escapeMermaidLabel(label)}" : ${series.values[i2]}`);
+    }
+  }
+  return lines.join(`
+`);
+}
+function serializeXYChart(input) {
+  const lines = [];
+  lines.push("xychart-beta");
+  if (input.title) {
+    lines.push(`  title "${escapeMermaidLabel(input.title)}"`);
+  }
+  const categorySeries = input.series.find((s) => s.categories && s.categories.length > 0);
+  if (categorySeries?.categories) {
+    const cats = categorySeries.categories.map((c) => `"${escapeMermaidLabel(c)}"`);
+    lines.push(`  x-axis [${cats.join(", ")}]`);
+  }
+  const isLine = input.chartType === "line" || input.chartType === "area";
+  for (const series of input.series) {
+    const values = series.values.map((v) => String(v));
+    const keyword = isLine ? "line" : "bar";
+    lines.push(`  ${keyword} [${values.join(", ")}]`);
+  }
+  return lines.join(`
+`);
+}
+function serializeChartToMermaid(input) {
+  if (input.series.length === 0) {
+    return "";
+  }
+  switch (input.chartType) {
+    case "pie":
+      return serializePie(input);
+    case "line":
+    case "area":
+    case "bar":
+    case "scatter":
+    case "radar":
+    case "other":
+    default:
+      return serializeXYChart(input);
+  }
+}
+// packages/@oxen-builder/mermaid/src/diagram-serializer.ts
+function inferDirection(shapes) {
+  if (shapes.length < 2) {
+    return "TD";
+  }
+  const withBounds = shapes.filter((s) => s.bounds);
+  if (withBounds.length < 2) {
+    return "TD";
+  }
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const s of withBounds) {
+    const b = s.bounds;
+    minX = Math.min(minX, b.x);
+    maxX = Math.max(maxX, b.x + b.width);
+    minY = Math.min(minY, b.y);
+    maxY = Math.max(maxY, b.y + b.height);
+  }
+  const spanX = maxX - minX;
+  const spanY = maxY - minY;
+  return spanY >= spanX ? "TD" : "LR";
+}
+function serializeDiagramToMermaid(input) {
+  const { shapes } = input;
+  if (shapes.length === 0) {
+    return "";
+  }
+  const direction = inferDirection(shapes);
+  const lines = [`flowchart ${direction}`];
+  for (const shape of shapes) {
+    const id = sanitizeNodeId(shape.id);
+    const label = shape.text ? escapeMermaidLabel(shape.text) : id;
+    lines.push(`  ${id}["${label}"]`);
+  }
+  if (shapes.length > 1) {
+    for (let i2 = 0;i2 < shapes.length - 1; i2++) {
+      const fromId = sanitizeNodeId(shapes[i2].id);
+      const toId = sanitizeNodeId(shapes[i2 + 1].id);
+      lines.push(`  ${fromId} --> ${toId}`);
+    }
+  }
+  return lines.join(`
+`);
+}
+// packages/@oxen-renderer/chart/src/mermaid/chart-renderer.ts
+function renderChartMermaid(params) {
+  const content = serializeChartToMermaid({
+    series: params.series,
+    chartType: params.chartType,
+    title: params.title
+  });
+  if (!content) {
+    return "";
+  }
+  return wrapInMermaidFence(content);
+}
+// packages/@oxen-renderer/diagram/src/mermaid/diagram-renderer.ts
+function renderDiagramMermaid(params) {
+  const content = serializeDiagramToMermaid({ shapes: params.shapes });
+  if (!content) {
+    return "";
+  }
+  return wrapInMermaidFence(content);
+}
+// packages/@oxen-renderer/pptx/src/mermaid/slide-renderer.ts
+function renderTable(content) {
+  const table = content.table;
+  if (!table || table.data.length === 0) {
+    return "";
+  }
+  const headers = table.data[0]?.cells.map((c) => c.text) ?? [];
+  const rows = table.data.slice(1).map((r) => r.cells.map((c) => c.text));
+  return renderMarkdownTable({ headers, rows });
+}
+function renderChart(content) {
+  const chart = content.chart;
+  if (!chart?.series || chart.series.length === 0) {
+    return "";
+  }
+  const extracted = extractChartData({
+    title: chart.title,
+    chartType: chart.chartType,
+    series: chart.series.map((s) => ({
+      name: s.name,
+      values: s.values?.map((v) => v ?? 0),
+      categories: s.categories
+    }))
+  });
+  return renderChartMermaid({
+    series: extracted.series,
+    chartType: extracted.chartType,
+    title: extracted.title
+  });
+}
+function renderDiagram(content) {
+  const diagram = content.diagram;
+  if (!diagram?.shapes || diagram.shapes.length === 0) {
+    return "";
+  }
+  return renderDiagramMermaid({
+    shapes: diagram.shapes.map((s, i2) => ({
+      id: `shape_${i2}`,
+      text: s.text,
+      bounds: s.bounds
+    }))
+  });
+}
+function renderShape(shape) {
+  if (shape.content) {
+    switch (shape.content.type) {
+      case "table":
+        return renderTable(shape.content);
+      case "chart":
+        return renderChart(shape.content);
+      case "diagram":
+        return renderDiagram(shape.content);
+      default:
+        return;
+    }
+  }
+  if (shape.text) {
+    return shape.text;
+  }
+  if (shape.placeholder?.type) {
+    return `*[${shape.placeholder.type}]*`;
+  }
+  return;
+}
+function renderSlideMermaid(params) {
+  const blocks = [];
+  for (const shape of params.shapes) {
+    const rendered = renderShape(shape);
+    if (rendered) {
+      blocks.push(rendered);
+    }
+  }
+  return blocks.join(`
+
+`);
+}
+// packages/@oxen-cli/pptx-cli/src/output/mermaid-output.ts
+function formatPreviewMermaid(data) {
+  const sections = [];
+  for (const slide of data.slides) {
+    const header = `## Slide ${slide.number}`;
+    const mermaid = renderSlideMermaid({ shapes: slide.shapes, slideNumber: slide.number });
+    sections.push(mermaid ? `${header}
+
+${mermaid}` : header);
+  }
+  return sections.join(`
+
+`);
+}
 
 // packages/@oxen-cli/pptx-cli/src/program.ts
 function createProgram() {
   const program2 = new Command;
-  program2.name("pptx").description("CLI tool for inspecting PPTX files").version("0.1.0").option("-o, --output <mode>", "Output mode (json|pretty)", "pretty");
-  program2.command("info").description("Display presentation metadata").argument("<file>", "PPTX file path").action(async (file) => {
+  program2.name("pptx").description("CLI tool for inspecting PPTX files").version("0.1.0").option("-o, --output <mode>", "Output mode (json|pretty|mermaid)", "pretty");
+  program2.command("info").description("Display presentation metadata").argument("<file>", "PPTX/PPT file path").action(async (file) => {
     const mode = program2.opts().output;
     const result = await runInfo(file);
     output(result, mode, formatInfoPretty);
   });
-  program2.command("list").description("List slides with summary").argument("<file>", "PPTX file path").action(async (file) => {
+  program2.command("list").description("List slides with summary").argument("<file>", "PPTX/PPT file path").action(async (file) => {
     const mode = program2.opts().output;
     const result = await runList(file);
     output(result, mode, formatListPretty);
   });
-  program2.command("show").description("Display slide content").argument("<file>", "PPTX file path").argument("<slide>", "Slide number (1-based)").action(async (file, slide) => {
+  program2.command("show").description("Display slide content").argument("<file>", "PPTX/PPT file path").argument("<slide>", "Slide number (1-based)").action(async (file, slide) => {
     const mode = program2.opts().output;
     const slideNumber = parseInt(slide, 10);
     if (Number.isNaN(slideNumber)) {
@@ -30322,12 +33844,12 @@ function createProgram() {
     const result = await runShow(file, slideNumber);
     output(result, mode, formatShowPretty);
   });
-  program2.command("extract").description("Extract text from slides").argument("<file>", "PPTX file path").option("--slides <range>", 'Slide range (e.g., "1,3-5")').action(async (file, options) => {
+  program2.command("extract").description("Extract text from slides").argument("<file>", "PPTX/PPT file path").option("--slides <range>", 'Slide range (e.g., "1,3-5")').action(async (file, options) => {
     const mode = program2.opts().output;
     const result = await runExtract(file, options);
     output(result, mode, formatExtractPretty);
   });
-  program2.command("theme").description("Display theme information (fonts, colors, styles)").argument("<file>", "PPTX file path").action(async (file) => {
+  program2.command("theme").description("Display theme information (fonts, colors, styles)").argument("<file>", "PPTX/PPT file path").action(async (file) => {
     const mode = program2.opts().output;
     const result = await runTheme(file);
     output(result, mode, formatThemePretty);
@@ -30342,7 +33864,7 @@ function createProgram() {
     const result = await runVerify(specPath, options);
     output(result, mode, formatVerifyPretty);
   });
-  program2.command("preview").description("Render ASCII art preview of a slide (omit slide number to show all)").argument("<file>", "PPTX file path").argument("[slide]", "Slide number (1-based, omit for all)").option("--width <columns>", "Terminal width in columns", "80").option("--border", "Show slide border outline").action(async (file, slide, options) => {
+  program2.command("preview").description("Render ASCII art preview of a slide (omit slide number to show all)").argument("<file>", "PPTX/PPT file path").argument("[slide]", "Slide number (1-based, omit for all)").option("--width <columns>", "Terminal width in columns", "80").option("--border", "Show slide border outline").action(async (file, slide, options) => {
     const mode = program2.opts().output;
     let slideNumber;
     if (slide !== undefined) {
@@ -30360,12 +33882,32 @@ function createProgram() {
       return;
     }
     const result = await runPreview(file, slideNumber, { width, border: options.border });
-    output(result, mode, formatPreviewPretty);
+    output(result, mode, formatPreviewPretty, formatPreviewMermaid);
+  });
+  program2.command("inventory").description("Display media inventory summary").argument("<file>", "PPTX/PPT file path").action(async (file) => {
+    const mode = program2.opts().output;
+    const result = await runInventory(file);
+    output(result, mode, formatInventoryPretty);
+  });
+  program2.command("tables").description("Display table information from slides").argument("<file>", "PPTX/PPT file path").option("--slides <range>", 'Slide range (e.g., "1,3-5")').action(async (file, options) => {
+    const mode = program2.opts().output;
+    const result = await runTables(file, options);
+    output(result, mode, formatTablesPretty);
+  });
+  program2.command("images").description("Display embedded image information from slides").argument("<file>", "PPTX/PPT file path").option("--slides <range>", 'Slide range (e.g., "1,3-5")').action(async (file, options) => {
+    const mode = program2.opts().output;
+    const result = await runImages(file, options);
+    output(result, mode, formatImagesPretty);
+  });
+  program2.command("diff").description("Compare text content between two PPTX files").argument("<fileA>", "First PPTX/PPT file path").argument("<fileB>", "Second PPTX/PPT file path").action(async (fileA, fileB) => {
+    const mode = program2.opts().output;
+    const result = await runDiff(fileA, fileB);
+    output(result, mode, formatDiffPretty);
   });
   return program2;
 }
 // packages/@oxen-cli/docx-cli/src/commands/info.ts
-import * as fs10 from "fs/promises";
+import * as fs5 from "fs/promises";
 
 // packages/@oxen-office/docx/src/constants.ts
 var RELATIONSHIP_TYPES2 = {
@@ -34003,7 +37545,7 @@ function buildSettingsInfo(settings) {
 }
 async function runInfo2(filePath) {
   try {
-    const buffer = await fs10.readFile(filePath);
+    const buffer = await fs5.readFile(filePath);
     const doc = await loadDocx(buffer);
     const sectPr = doc.body.sectPr;
     const pageSize = buildPageSize(sectPr?.pgSz);
@@ -34030,7 +37572,7 @@ async function runInfo2(filePath) {
 }
 
 // packages/@oxen-cli/docx-cli/src/commands/list.ts
-import * as fs11 from "fs/promises";
+import * as fs6 from "fs/promises";
 
 // packages/@oxen-office/docx/src/domain/text-utils.ts
 function extractTextFromRunContent(content) {
@@ -34110,7 +37652,7 @@ function getFirstParagraphText(content) {
 }
 async function runList2(filePath) {
   try {
-    const buffer = await fs11.readFile(filePath);
+    const buffer = await fs6.readFile(filePath);
     const doc = await loadDocx(buffer);
     const sections = splitIntoSections(doc.body);
     const items = sections.map((section, index) => {
@@ -34149,7 +37691,7 @@ async function runList2(filePath) {
 }
 
 // packages/@oxen-cli/docx-cli/src/commands/show.ts
-import * as fs12 from "fs/promises";
+import * as fs7 from "fs/promises";
 
 // packages/@oxen-cli/docx-cli/src/serializers/paragraph-serializer.ts
 function extractTextFromRunContent2(content) {
@@ -34329,7 +37871,7 @@ function serializeBlockContent(block) {
 }
 async function runShow2(filePath, sectionNumber) {
   try {
-    const buffer = await fs12.readFile(filePath);
+    const buffer = await fs7.readFile(filePath);
     const doc = await loadDocx(buffer);
     const sections = splitIntoSections2(doc.body);
     if (sectionNumber < 1 || sectionNumber > sections.length) {
@@ -34351,7 +37893,7 @@ async function runShow2(filePath, sectionNumber) {
 }
 
 // packages/@oxen-cli/docx-cli/src/commands/extract.ts
-import * as fs13 from "fs/promises";
+import * as fs8 from "fs/promises";
 function parseRangePart2(part, maxSection, result) {
   if (part.includes("-")) {
     const [startStr, endStr] = part.split("-").map((s) => s.trim());
@@ -34402,7 +37944,7 @@ function getSectionNumbers(options, count) {
 }
 async function runExtract2(filePath, options) {
   try {
-    const buffer = await fs13.readFile(filePath);
+    const buffer = await fs8.readFile(filePath);
     const doc = await loadDocx(buffer);
     const sections = splitIntoSections3(doc.body);
     const sectionNumbers = getSectionNumbers(options, sections.length);
@@ -34422,18 +37964,18 @@ async function runExtract2(filePath, options) {
 }
 
 // packages/@oxen-cli/docx-cli/src/commands/build.ts
-import * as fs14 from "fs/promises";
+import * as fs9 from "fs/promises";
 import * as path6 from "path";
 async function runBuild2(specPath) {
   try {
-    const specJson = await fs14.readFile(specPath, "utf-8");
+    const specJson = await fs9.readFile(specPath, "utf-8");
     const spec = JSON.parse(specJson);
     const specDir = path6.dirname(specPath);
     const templatePath = path6.resolve(specDir, spec.template);
     const outputPath = path6.resolve(specDir, spec.output);
-    await fs14.access(templatePath);
-    await fs14.mkdir(path6.dirname(outputPath), { recursive: true });
-    await fs14.copyFile(templatePath, outputPath);
+    await fs9.access(templatePath);
+    await fs9.mkdir(path6.dirname(outputPath), { recursive: true });
+    await fs9.copyFile(templatePath, outputPath);
     return success({ outputPath: spec.output, success: true });
   } catch (err2) {
     if (err2.code === "ENOENT") {
@@ -34447,7 +37989,7 @@ async function runBuild2(specPath) {
 }
 
 // packages/@oxen-cli/docx-cli/src/commands/verify.ts
-import * as fs15 from "fs/promises";
+import * as fs10 from "fs/promises";
 import * as path7 from "path";
 function createAssertion2(path8, expected, actual) {
   return {
@@ -34464,9 +38006,9 @@ async function runTestCase2(spec, specDir) {
     template: path7.resolve(specDir, spec.input.template),
     output: path7.resolve(specDir, spec.input.output)
   };
-  await fs15.mkdir(path7.dirname(input.output), { recursive: true });
+  await fs10.mkdir(path7.dirname(input.output), { recursive: true });
   const tempSpecPath = path7.join(path7.dirname(input.output), `${spec.name}.build.json`);
-  await fs15.writeFile(tempSpecPath, JSON.stringify(input, null, 2));
+  await fs10.writeFile(tempSpecPath, JSON.stringify(input, null, 2));
   try {
     const buildResult = await runBuild2(tempSpecPath);
     if (!buildResult.success) {
@@ -34503,15 +38045,15 @@ async function runTestCase2(spec, specDir) {
     const passed = assertions.every((a) => a.passed);
     return { name: spec.name, passed, assertions };
   } finally {
-    await fs15.unlink(tempSpecPath).catch(() => {});
+    await fs10.unlink(tempSpecPath).catch(() => {});
   }
 }
 async function findTestCaseFiles2(targetPath) {
-  const stat3 = await fs15.stat(targetPath);
+  const stat3 = await fs10.stat(targetPath);
   if (stat3.isFile()) {
     return [targetPath];
   }
-  const entries = await fs15.readdir(targetPath, { withFileTypes: true });
+  const entries = await fs10.readdir(targetPath, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
     if (entry.isFile() && entry.name.endsWith(".json") && !entry.name.includes(".build.")) {
@@ -34524,7 +38066,7 @@ async function findTestCaseFiles2(targetPath) {
   return files.sort();
 }
 async function loadTestCase2(filePath) {
-  const content = await fs15.readFile(filePath, "utf-8");
+  const content = await fs10.readFile(filePath, "utf-8");
   return JSON.parse(content);
 }
 async function runVerify2(specPath, options = {}) {
@@ -34562,10 +38104,10 @@ async function runVerify2(specPath, options = {}) {
 }
 
 // packages/@oxen-cli/docx-cli/src/commands/styles.ts
-import * as fs16 from "fs/promises";
+import * as fs11 from "fs/promises";
 async function runStyles(filePath, options = {}) {
   try {
-    const buffer = await fs16.readFile(filePath);
+    const buffer = await fs11.readFile(filePath);
     const doc = await loadDocx(buffer);
     if (!doc.styles) {
       return success({
@@ -34618,7 +38160,7 @@ async function runStyles(filePath, options = {}) {
 }
 
 // packages/@oxen-cli/docx-cli/src/commands/numbering.ts
-import * as fs17 from "fs/promises";
+import * as fs12 from "fs/promises";
 function serializeLevel(level) {
   return {
     ilvl: level.ilvl,
@@ -34647,7 +38189,7 @@ function serializeNum(num) {
 }
 async function runNumbering(filePath) {
   try {
-    const buffer = await fs17.readFile(filePath);
+    const buffer = await fs12.readFile(filePath);
     const doc = await loadDocx(buffer);
     if (!doc.numbering) {
       return success({
@@ -34674,10 +38216,10 @@ async function runNumbering(filePath) {
 }
 
 // packages/@oxen-cli/docx-cli/src/commands/headers-footers.ts
-import * as fs18 from "fs/promises";
+import * as fs13 from "fs/promises";
 async function runHeadersFooters(filePath) {
   try {
-    const buffer = await fs18.readFile(filePath);
+    const buffer = await fs13.readFile(filePath);
     const doc = await loadDocx(buffer);
     const items = [];
     if (doc.headers) {
@@ -34722,7 +38264,7 @@ async function runHeadersFooters(filePath) {
 }
 
 // packages/@oxen-cli/docx-cli/src/commands/tables.ts
-import * as fs19 from "fs/promises";
+import * as fs14 from "fs/promises";
 function serializeTable3(table, index) {
   const rowCount = table.rows.length;
   const colCount = table.rows[0]?.cells.length ?? 0;
@@ -34741,9 +38283,9 @@ function serializeTable3(table, index) {
     ...firstCellPreview && { firstCellPreview }
   };
 }
-async function runTables(filePath) {
+async function runTables2(filePath) {
   try {
-    const buffer = await fs19.readFile(filePath);
+    const buffer = await fs14.readFile(filePath);
     const doc = await loadDocx(buffer);
     const tables = [];
     let tableIndex = 0;
@@ -34766,10 +38308,10 @@ async function runTables(filePath) {
 }
 
 // packages/@oxen-cli/docx-cli/src/commands/comments.ts
-import * as fs20 from "fs/promises";
+import * as fs15 from "fs/promises";
 async function runComments(filePath) {
   try {
-    const buffer = await fs20.readFile(filePath);
+    const buffer = await fs15.readFile(filePath);
     const doc = await loadDocx(buffer);
     if (!doc.comments || doc.comments.comment.length === 0) {
       return success({
@@ -34798,7 +38340,7 @@ async function runComments(filePath) {
 }
 
 // packages/@oxen-cli/docx-cli/src/commands/images.ts
-import * as fs21 from "fs/promises";
+import * as fs16 from "fs/promises";
 function extractImageFromDrawing(drawing, index) {
   const base = {
     index,
@@ -34855,9 +38397,9 @@ function extractImagesFromContent(content, images) {
     }
   }
 }
-async function runImages(filePath) {
+async function runImages2(filePath) {
   try {
-    const buffer = await fs21.readFile(filePath);
+    const buffer = await fs16.readFile(filePath);
     const doc = await loadDocx(buffer);
     const images = [];
     extractImagesFromContent(doc.body.content, images);
@@ -34884,7 +38426,7 @@ async function runImages(filePath) {
 }
 
 // packages/@oxen-cli/docx-cli/src/commands/toc.ts
-import * as fs22 from "fs/promises";
+import * as fs17 from "fs/promises";
 function extractTocFromParagraph(paragraph, entries) {
   const outlineLvl = paragraph.properties?.outlineLvl;
   if (outlineLvl === undefined) {
@@ -34909,7 +38451,7 @@ function extractTocFromContent(content, entries) {
 }
 async function runToc(filePath, options = {}) {
   try {
-    const buffer = await fs22.readFile(filePath);
+    const buffer = await fs17.readFile(filePath);
     const doc = await loadDocx(buffer);
     const entries = [];
     extractTocFromContent(doc.body.content, entries);
@@ -34930,7 +38472,7 @@ async function runToc(filePath, options = {}) {
 }
 
 // packages/@oxen-cli/docx-cli/src/commands/preview.ts
-import * as fs23 from "fs/promises";
+import * as fs18 from "fs/promises";
 
 // packages/@oxen-renderer/docx/src/ascii/paragraph-renderer.ts
 function renderHeading(para, width) {
@@ -35087,7 +38629,7 @@ function convertBlock(block) {
 }
 async function runPreview2(filePath, sectionNumber, options) {
   try {
-    const buffer = await fs23.readFile(filePath);
+    const buffer = await fs18.readFile(filePath);
     const doc = await loadDocx(buffer);
     const sections = splitIntoSections4(doc.body);
     if (sectionNumber !== undefined && (sectionNumber < 1 || sectionNumber > sections.length)) {
@@ -35116,6 +38658,7 @@ async function runPreview2(filePath, sectionNumber, options) {
       results.push({
         number: i2,
         ascii,
+        blocks,
         paragraphCount,
         tableCount
       });
@@ -35359,7 +38902,7 @@ function formatHeadersFootersPretty(data) {
   return lines.join(`
 `).trim();
 }
-function formatTablesPretty(data) {
+function formatTablesPretty2(data) {
   if (data.count === 0) {
     return "No tables found";
   }
@@ -35376,7 +38919,7 @@ function formatTablesPretty(data) {
   return lines.join(`
 `).trim();
 }
-function formatImagesPretty(data) {
+function formatImagesPretty2(data) {
   if (data.count === 0) {
     return "No images found";
   }
@@ -35462,10 +39005,68 @@ function formatCommentsPretty(data) {
 `).trim();
 }
 
+// packages/@oxen-renderer/docx/src/mermaid/document-renderer.ts
+function renderParagraph(para) {
+  const text = para.text.trim();
+  if (!text) {
+    return "";
+  }
+  if (para.headingLevel !== undefined) {
+    const hashes = "#".repeat(Math.min(para.headingLevel + 1, 6));
+    return `${hashes} ${text}`;
+  }
+  if (para.numbering) {
+    const indent = "  ".repeat(para.numbering.level);
+    return `${indent}1. ${text}`;
+  }
+  return text;
+}
+function renderTable2(table) {
+  if (table.rows.length === 0) {
+    return "";
+  }
+  const headers = table.rows[0]?.cells.map((c) => c.text) ?? [];
+  const dataRows = table.rows.slice(1).map((r) => r.cells.map((c) => c.text));
+  return renderMarkdownTable({ headers, rows: dataRows });
+}
+function renderDocxMermaid(params) {
+  const sections = [];
+  for (const block of params.blocks) {
+    if (block.type === "paragraph") {
+      const rendered = renderParagraph(block);
+      if (rendered) {
+        sections.push(rendered);
+      }
+    } else if (block.type === "table") {
+      const rendered = renderTable2(block);
+      if (rendered) {
+        sections.push(rendered);
+      }
+    }
+  }
+  return sections.join(`
+
+`);
+}
+// packages/@oxen-cli/docx-cli/src/output/mermaid-output.ts
+function formatPreviewMermaid2(data) {
+  const sections = [];
+  for (const section of data.sections) {
+    const header = `## Section ${section.number}`;
+    const mermaid = renderDocxMermaid({ blocks: section.blocks });
+    sections.push(mermaid ? `${header}
+
+${mermaid}` : header);
+  }
+  return sections.join(`
+
+`);
+}
+
 // packages/@oxen-cli/docx-cli/src/program.ts
 function createProgram2() {
   const program2 = new Command;
-  program2.name("docx").description("CLI tool for inspecting DOCX files").version("0.1.0").option("-o, --output <mode>", "Output mode (json|pretty)", "pretty");
+  program2.name("docx").description("CLI tool for inspecting DOCX files").version("0.1.0").option("-o, --output <mode>", "Output mode (json|pretty|mermaid)", "pretty");
   program2.command("info").description("Display document metadata").argument("<file>", "DOCX file path").action(async (file) => {
     const mode = program2.opts().output;
     const result = await runInfo2(file);
@@ -35519,8 +39120,8 @@ function createProgram2() {
   });
   program2.command("tables").description("Display table information").argument("<file>", "DOCX file path").action(async (file) => {
     const mode = program2.opts().output;
-    const result = await runTables(file);
-    output(result, mode, formatTablesPretty);
+    const result = await runTables2(file);
+    output(result, mode, formatTablesPretty2);
   });
   program2.command("comments").description("Display document comments").argument("<file>", "DOCX file path").action(async (file) => {
     const mode = program2.opts().output;
@@ -35529,8 +39130,8 @@ function createProgram2() {
   });
   program2.command("images").description("Display embedded images").argument("<file>", "DOCX file path").action(async (file) => {
     const mode = program2.opts().output;
-    const result = await runImages(file);
-    output(result, mode, formatImagesPretty);
+    const result = await runImages2(file);
+    output(result, mode, formatImagesPretty2);
   });
   program2.command("toc").description("Display table of contents (based on outline levels)").argument("<file>", "DOCX file path").option("--max-level <level>", "Maximum heading level to include (0-9)", "9").action(async (file, options) => {
     const mode = program2.opts().output;
@@ -35556,12 +39157,12 @@ function createProgram2() {
       return;
     }
     const result = await runPreview2(file, sectionNumber, { width });
-    output(result, mode, formatPreviewPretty2);
+    output(result, mode, formatPreviewPretty2, formatPreviewMermaid2);
   });
   return program2;
 }
 // packages/@oxen-cli/xlsx-cli/src/utils/xlsx-loader.ts
-import * as fs24 from "fs/promises";
+import * as fs19 from "fs/promises";
 
 // packages/@oxen-office/xlsx/src/domain/style/types.ts
 function createDefaultStyleSheet() {
@@ -39268,7 +42869,7 @@ async function parseXlsxWorkbook(getFileContent, options) {
 
 // packages/@oxen-cli/xlsx-cli/src/utils/xlsx-loader.ts
 async function loadXlsxWorkbook(filePath, options) {
-  const buffer = await fs24.readFile(filePath);
+  const buffer = await fs19.readFile(filePath);
   const pkg = await loadZipPackage(buffer);
   const getFileContent = async (path8) => {
     return pkg.readText(path8) ?? undefined;
@@ -39607,18 +43208,18 @@ async function runExtract3(filePath, options = {}) {
 }
 
 // packages/@oxen-cli/xlsx-cli/src/commands/build.ts
-import * as fs25 from "fs/promises";
+import * as fs20 from "fs/promises";
 import * as path8 from "path";
 async function runBuild3(specPath) {
   try {
-    const specJson = await fs25.readFile(specPath, "utf-8");
+    const specJson = await fs20.readFile(specPath, "utf-8");
     const spec = JSON.parse(specJson);
     const specDir = path8.dirname(specPath);
     const templatePath = path8.resolve(specDir, spec.template);
     const outputPath = path8.resolve(specDir, spec.output);
-    await fs25.access(templatePath);
-    await fs25.mkdir(path8.dirname(outputPath), { recursive: true });
-    await fs25.copyFile(templatePath, outputPath);
+    await fs20.access(templatePath);
+    await fs20.mkdir(path8.dirname(outputPath), { recursive: true });
+    await fs20.copyFile(templatePath, outputPath);
     return success({ outputPath: spec.output, success: true });
   } catch (err2) {
     if (err2.code === "ENOENT") {
@@ -39632,7 +43233,7 @@ async function runBuild3(specPath) {
 }
 
 // packages/@oxen-cli/xlsx-cli/src/commands/verify.ts
-import * as fs26 from "fs/promises";
+import * as fs21 from "fs/promises";
 import * as path9 from "path";
 function createAssertion3(path10, expected, actual) {
   return {
@@ -39649,9 +43250,9 @@ async function runTestCase3(spec, specDir) {
     template: path9.resolve(specDir, spec.input.template),
     output: path9.resolve(specDir, spec.input.output)
   };
-  await fs26.mkdir(path9.dirname(input.output), { recursive: true });
+  await fs21.mkdir(path9.dirname(input.output), { recursive: true });
   const tempSpecPath = path9.join(path9.dirname(input.output), `${spec.name}.build.json`);
-  await fs26.writeFile(tempSpecPath, JSON.stringify(input, null, 2));
+  await fs21.writeFile(tempSpecPath, JSON.stringify(input, null, 2));
   try {
     const buildResult = await runBuild3(tempSpecPath);
     if (!buildResult.success) {
@@ -39685,15 +43286,15 @@ async function runTestCase3(spec, specDir) {
     const passed = assertions.every((a) => a.passed);
     return { name: spec.name, passed, assertions };
   } finally {
-    await fs26.unlink(tempSpecPath).catch(() => {});
+    await fs21.unlink(tempSpecPath).catch(() => {});
   }
 }
 async function findTestCaseFiles3(targetPath) {
-  const stat4 = await fs26.stat(targetPath);
+  const stat4 = await fs21.stat(targetPath);
   if (stat4.isFile()) {
     return [targetPath];
   }
-  const entries = await fs26.readdir(targetPath, { withFileTypes: true });
+  const entries = await fs21.readdir(targetPath, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
     if (entry.isFile() && entry.name.endsWith(".json") && !entry.name.includes(".build.")) {
@@ -39706,7 +43307,7 @@ async function findTestCaseFiles3(targetPath) {
   return files.sort();
 }
 async function loadTestCase3(filePath) {
-  const content = await fs26.readFile(filePath, "utf-8");
+  const content = await fs21.readFile(filePath, "utf-8");
   return JSON.parse(content);
 }
 async function runVerify3(specPath, options = {}) {
@@ -50682,7 +54283,7 @@ function formatRange2(range2) {
 }
 
 // packages/@oxen-cli/xlsx-cli/src/commands/tables.ts
-async function runTables2(filePath) {
+async function runTables3(filePath) {
   try {
     const workbook = await loadXlsxWorkbook(filePath);
     if (!workbook.tables || workbook.tables.length === 0) {
@@ -51213,6 +54814,7 @@ async function runPreview3(filePath, sheetName, options) {
         results.push({
           name: sheet.name,
           ascii: `(empty sheet: ${sheet.name})`,
+          rows: [],
           rowCount: 0,
           colCount: 0
         });
@@ -51258,6 +54860,7 @@ async function runPreview3(filePath, sheetName, options) {
       results.push({
         name: sheet.name,
         ascii,
+        rows: asciiRows,
         rowCount: asciiRows.length,
         colCount
       });
@@ -51435,7 +55038,7 @@ function formatNamesPretty(data) {
   return lines.join(`
 `);
 }
-function formatTablesPretty2(data) {
+function formatTablesPretty3(data) {
   if (data.count === 0) {
     return "No tables found";
   }
@@ -51757,10 +55360,94 @@ function formatStylesPretty2(data) {
 `);
 }
 
+// packages/@oxen-renderer/xlsx/src/mermaid/sheet-renderer.ts
+function indexToColumnLetter3(index) {
+  let result = "";
+  let n = index;
+  while (n >= 0) {
+    result = String.fromCharCode(n % 26 + 65) + result;
+    n = Math.floor(n / 26) - 1;
+  }
+  return result;
+}
+function formatCellValue4(cell) {
+  if (cell.value === null || cell.value === undefined) {
+    return "";
+  }
+  if (cell.type === "number" && typeof cell.value === "number") {
+    return cell.value.toLocaleString("en-US");
+  }
+  return String(cell.value);
+}
+function renderSheetMermaid(params) {
+  const { rows, columnCount, showRowNumbers = true, showColumnHeaders = true } = params;
+  if (rows.length === 0 || columnCount === 0) {
+    return `(empty sheet: ${params.name})`;
+  }
+  const headers = [];
+  if (showRowNumbers) {
+    headers.push("");
+  }
+  if (showColumnHeaders) {
+    for (let c = 0;c < columnCount; c++) {
+      headers.push(indexToColumnLetter3(c));
+    }
+  }
+  const alignments = [];
+  if (showRowNumbers) {
+    alignments.push("right");
+  }
+  for (let c = 0;c < columnCount; c++) {
+    let align = "left";
+    for (const row of rows) {
+      if (c < row.cells.length && row.cells[c].type !== "empty") {
+        align = row.cells[c].type === "number" ? "right" : "left";
+        break;
+      }
+    }
+    alignments.push(align);
+  }
+  const dataRows = [];
+  for (const row of rows) {
+    const rowData = [];
+    if (showRowNumbers) {
+      rowData.push(String(row.rowNumber));
+    }
+    for (let c = 0;c < columnCount; c++) {
+      const cell = c < row.cells.length ? row.cells[c] : { value: null, type: "empty" };
+      rowData.push(formatCellValue4(cell));
+    }
+    dataRows.push(rowData);
+  }
+  return renderMarkdownTable({
+    headers: showColumnHeaders ? headers : headers.slice(0, showRowNumbers ? 1 : 0),
+    rows: dataRows,
+    alignments
+  });
+}
+// packages/@oxen-cli/xlsx-cli/src/output/mermaid-output.ts
+function formatPreviewMermaid3(data) {
+  const sections = [];
+  for (const sheet of data.sheets) {
+    const header = `## ${sheet.name}`;
+    const mermaid = renderSheetMermaid({
+      name: sheet.name,
+      rows: sheet.rows,
+      columnCount: sheet.colCount
+    });
+    sections.push(mermaid ? `${header}
+
+${mermaid}` : header);
+  }
+  return sections.join(`
+
+`);
+}
+
 // packages/@oxen-cli/xlsx-cli/src/program.ts
 function createProgram3() {
   const program2 = new Command;
-  program2.name("xlsx").description("CLI tool for inspecting XLSX files").version("0.1.0").option("-o, --output <mode>", "Output mode (json|pretty)", "pretty");
+  program2.name("xlsx").description("CLI tool for inspecting XLSX files").version("0.1.0").option("-o, --output <mode>", "Output mode (json|pretty|mermaid)", "pretty");
   program2.command("info").description("Display workbook metadata").argument("<file>", "XLSX file path").action(async (file) => {
     const mode = program2.opts().output;
     const result = await runInfo3(file);
@@ -51809,8 +55496,8 @@ function createProgram3() {
   });
   program2.command("tables").description("Display table definitions (ListObjects)").argument("<file>", "XLSX file path").action(async (file) => {
     const mode = program2.opts().output;
-    const result = await runTables2(file);
-    output(result, mode, formatTablesPretty2);
+    const result = await runTables3(file);
+    output(result, mode, formatTablesPretty3);
   });
   program2.command("comments").description("Display cell comments").argument("<file>", "XLSX file path").option("--sheet <name>", "Filter by sheet name").action(async (file, options) => {
     const mode = program2.opts().output;
@@ -51851,7 +55538,7 @@ function createProgram3() {
       return;
     }
     const result = await runPreview3(file, sheet, { width, range: options.range });
-    output(result, mode, formatPreviewPretty3);
+    output(result, mode, formatPreviewPretty3, formatPreviewMermaid3);
   });
   return program2;
 }
