@@ -1,34 +1,38 @@
 {
-  "$schema": "https://raw.githubusercontent.com/anthropics/skills/main/spec/plugin.schema.json",
   "name": "claude-skills",
-  "displayName": "Claude Skills",
-  "description": "A collection of skills for Claude Code. Document manipulation, automation, and more.",
-  "version": "1.0.0",
-  "repository": "trkbt10/claude-skills",
-  "skills": [
-    {
-      "id": "slide-studio",
-      "name": "Slide Studio",
-      "path": "slide-studio",
-      "description": "Create and modify PowerPoint presentations (PPTX) through direct XML manipulation. Use this skill when creating presentations from scratch, adding/editing slides, inserting images, or applying POTX templates. Supports all 11 standard Office slide layouts.",
-      "tags": ["pptx", "powerpoint", "presentation", "office", "document"]
-    },
-    {
-      "id": "oxen-office",
-      "name": "Oxen Office",
-      "path": "oxen-office",
-      "description": "Inspect, build, and verify Office documents (PPTX, DOCX, XLSX) using the oxen CLI. Supports ASCII preview, JSON spec-based building, text extraction, and comprehensive document analysis.",
-      "tags": ["pptx", "docx", "xlsx", "office", "inspection", "build", "cli"]
-    }
-  ],
-  "author": {
+  "owner": {
     "name": "trkbt10"
   },
-  "license": "MIT",
-  "keywords": [
-    "claude-code",
-    "skills",
-    "automation",
-    "document"
+  "metadata": {
+    "description": "Office document manipulation plugins for Claude Code",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "slide-studio",
+      "source": "./skills/slide-studio",
+      "description": "Create and modify PowerPoint presentations (PPTX) through direct XML manipulation. Supports all 11 standard Office slide layouts.",
+      "version": "1.0.0",
+      "author": {
+        "name": "trkbt10"
+      },
+      "license": "MIT",
+      "keywords": ["pptx", "powerpoint", "presentation", "office", "document"],
+      "category": "document",
+      "tags": ["pptx", "powerpoint", "presentation"]
+    },
+    {
+      "name": "oxen-office",
+      "source": "./skills/oxen-office",
+      "description": "Inspect, build, and verify Office documents (PPTX, DOCX, XLSX) using the oxen CLI. Supports ASCII preview, JSON spec-based building, and text extraction.",
+      "version": "1.0.0",
+      "author": {
+        "name": "trkbt10"
+      },
+      "license": "MIT",
+      "keywords": ["pptx", "docx", "xlsx", "office", "cli"],
+      "category": "document",
+      "tags": ["pptx", "docx", "xlsx", "office", "cli"]
+    }
   ]
 }

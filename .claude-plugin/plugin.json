@@ -1,7 +1,7 @@
 {
   "name": "claude-skills",
+  "description": "Office document manipulation plugins for Claude Code",
   "version": "1.0.0",
-  "description": "A collection of skills for Claude Code. Document manipulation, automation, and more.",
   "author": {
     "name": "trkbt10"
   },
