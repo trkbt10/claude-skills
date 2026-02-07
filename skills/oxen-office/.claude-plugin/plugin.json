@@ -1,5 +1,5 @@
 {
   "name": "oxen-office",
   "description": "Inspect, build, and verify Office documents (PPTX, DOCX, XLSX) using the oxen CLI",
-  "version": "1.0.0"
+  "version": "1.0.1"
 }
